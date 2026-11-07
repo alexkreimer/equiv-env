@@ -51,6 +51,7 @@ class Task:
     self_check_time_s: float = 0.0
     speed_baseline: dict | None = None
     io_tests: list[dict] | None = None
+    input_ranges: dict | None = None  # {param_name: (min, max)} or None if full range
     n_loops: int = 0
     loc: int = 0
 

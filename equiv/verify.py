@@ -406,3 +406,171 @@ def verify_batch(
                 results[idx] = VerifyResult(status="checker_error", details=str(e))
 
     return results
+
+
+def check_original_ub(
+    task: Task,
+    *,
+    timeout_s: float = 60,
+    maxn: int = 8,
+    unwind: int | None = None,
+) -> tuple[bool, dict | None]:
+    """Run CBMC on the original function alone with all safety checks ON.
+
+    If the original has undefined behavior, try narrowing input ranges once
+    (scalars to [-2^15, 2^15]). If still failing, the function is rejected.
+
+    Returns:
+        (ub_free, input_ranges) — ub_free=True means no UB found.
+        input_ranges is None if full range is safe, or {param: (min, max)}.
+    """
+    if unwind is None:
+        unwind = maxn + 2
+
+    from .harness import _rename_function, _filter_deps
+
+    # Generate a minimal harness: original function + symbolic inputs + call
+    harness_src = _build_ub_check_harness(task, maxn, use_narrow_ranges=False)
+
+    with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+        f.write(harness_src)
+        harness_path = f.name
+
+    try:
+        result = _run_cbmc_raw(harness_path, unwind, timeout_s, extra_flags=None)
+    except subprocess.TimeoutExpired:
+        return False, None  # can't check — reject
+    finally:
+        try:
+            os.unlink(harness_path)
+        except OSError:
+            pass
+
+    # Check if any safety property failed
+    has_failures = _has_safety_failures(result.stdout)
+    if has_failures:
+        # Try with narrowed ranges
+        harness_src_narrow = _build_ub_check_harness(task, maxn, use_narrow_ranges=True)
+        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+            f.write(harness_src_narrow)
+            harness_path = f.name
+
+        try:
+            result_narrow = _run_cbmc_raw(harness_path, unwind, timeout_s, extra_flags=None)
+        finally:
+            try:
+                os.unlink(harness_path)
+            except OSError:
+                pass
+
+        if _has_safety_failures(result_narrow.stdout):
+            return False, None  # ub_in_original
+
+        ranges = _narrow_ranges(task)
+        return True, ranges
+
+    return True, None  # no UB, full range
+
+
+def _build_ub_check_harness(task: Task, maxn: int, use_narrow_ranges: bool) -> str:
+    """Build a harness that calls only the original with symbolic inputs."""
+    from .harness import _rename_function, _filter_deps
+
+    parts = []
+    parts.append("#include <assert.h>")
+    parts.append("#include <stdint.h>")
+    parts.append("#include <stddef.h>")
+    parts.append(f"#define MAXN {maxn}")
+    parts.append("")
+
+    if task.deps_src:
+        filtered = _filter_deps(task.deps_src)
+        if filtered:
+            parts.append(filtered)
+
+    parts.append("int nondet_int(void);")
+    parts.append("unsigned int nondet_uint(void);")
+
+    renamed = _rename_function(task.func_src, task.func_name, task.func_name)
+    if renamed is None:
+        renamed = task.func_src
+    parts.append(renamed)
+
+    parts.append("void harness(void) {")
+    sig = task.signature
+
+    narrow_min = -32768
+    narrow_max = 32767
+
+    for name, c_type in sig.params:
+        if c_type.endswith("*"):
+            pointee = c_type.rstrip("*").replace("const ", "").strip()
+            parts.append(f"  {pointee} {name}_buf[MAXN];")
+            if use_narrow_ranges:
+                parts.append(f"  for (int __i = 0; __i < MAXN; __i++) {{")
+                parts.append(f"    {name}_buf[__i] = ({pointee})nondet_int();")
+                parts.append(f"    __CPROVER_assume({name}_buf[__i] >= {narrow_min} && {name}_buf[__i] <= {narrow_max});")
+                parts.append(f"  }}")
+            else:
+                parts.append(f"  for (int __i = 0; __i < MAXN; __i++)")
+                parts.append(f"    {name}_buf[__i] = ({pointee})nondet_int();")
+        else:
+            parts.append(f"  {c_type} {name} = ({c_type})nondet_int();")
+            if use_narrow_ranges:
+                parts.append(f"  __CPROVER_assume({name} >= {narrow_min} && {name} <= {narrow_max});")
+
+    args = []
+    for name, c_type in sig.params:
+        if c_type.endswith("*"):
+            args.append(f"{name}_buf")
+        else:
+            args.append(name)
+
+    if sig.return_type != "void":
+        parts.append(f"  {sig.return_type} __r = {task.func_name}({', '.join(args)});")
+    else:
+        parts.append(f"  {task.func_name}({', '.join(args)});")
+
+    parts.append("}")
+    return "\n".join(parts)
+
+
+def _run_cbmc_raw(
+    harness_path: str, unwind: int, timeout_s: float, extra_flags: list[str] | None
+) -> subprocess.CompletedProcess:
+    """Run CBMC and return the raw result."""
+    flags = [
+        "cbmc", "--arch", "x86_64",
+        "--function", "harness",
+        "--unwind", str(unwind),
+        "--unwinding-assertions",
+    ]
+    if extra_flags:
+        flags.extend(extra_flags)
+    flags.append(harness_path)
+
+    return subprocess.run(flags, capture_output=True, text=True, timeout=timeout_s)
+
+
+def _has_safety_failures(stdout: str) -> bool:
+    """Check if any non-assertion property failed."""
+    patterns = [
+        r'\[.*\.overflow\.\d+\].*FAILURE',
+        r'\[.*\.pointer_dereference\.\d+\].*FAILURE',
+        r'\[.*\.array_bounds\.\d+\].*FAILURE',
+        r'\[.*\.undefined-shift\.\d+\].*FAILURE',
+        r'\[.*\.div-by-zero\.\d+\].*FAILURE',
+    ]
+    for p in patterns:
+        if re.search(p, stdout):
+            return True
+    return False
+
+
+def _narrow_ranges(task: Task) -> dict:
+    """Build narrowed input ranges. Returns dict with '_narrowed': True always."""
+    ranges = {"_narrowed": True}
+    for name, c_type in task.signature.params:
+        if not c_type.endswith("*"):
+            ranges[name] = (-32768, 32767)
+    return ranges

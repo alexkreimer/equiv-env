@@ -66,6 +66,7 @@ def evaluate(
     maxn: int = 8,
     skip_tests: bool = False,
     extra_cbmc_flags: list[str] | None = None,
+    _allow_overflow_off: bool = False,  # internal: only for self-equiv
 ) -> EvalResult:
     """Evaluate a candidate against the original function.
 
@@ -82,6 +83,15 @@ def evaluate(
     Returns:
         EvalResult with status and timing information.
     """
+    # Enforce: candidate checks MUST run with signed-overflow-check ON.
+    # --no-signed-overflow-check is only allowed for self-equivalence.
+    if extra_cbmc_flags and "--no-signed-overflow-check" in extra_cbmc_flags:
+        if not _allow_overflow_off:
+            raise ValueError(
+                "--no-signed-overflow-check is only allowed for self-equivalence "
+                "checks. Candidate checks must run with all safety checks ON."
+            )
+
     start_time = time.monotonic()
 
     # Check cache
