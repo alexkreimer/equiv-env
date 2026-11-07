@@ -210,6 +210,12 @@ def generate_harness(task: Task, candidate_src: str, maxn: int = 8, unwind: int 
 
     # 3. MAXN definition
     parts.append(f"#define MAXN {maxn}")
+    parts.append("")
+
+    # Platform: x86-64 target with signed char
+    parts.append("/* Platform assumption: x86-64, char is signed */")
+    parts.append("/* Compile with: -fsigned-char, CBMC: --arch x86_64 */")
+    parts.append("")
 
     # 4. Nondet declarations + stubs
     parts.append(NONDET_DECLS)

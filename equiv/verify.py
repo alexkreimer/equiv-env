@@ -133,6 +133,7 @@ def _run_cbmc(
     """Run CBMC and parse the output."""
     flags = [
         "cbmc",
+        "--arch", "x86_64",
         "--function", "harness",
         "--unwind", str(unwind),
         "--unwinding-assertions",
@@ -292,6 +293,7 @@ def _get_counterexample(
     """Re-run CBMC with --trace to get counterexample input values."""
     flags = [
         "cbmc",
+        "--arch", "x86_64",
         "--function", "harness",
         "--unwind", str(unwind),
         "--unwinding-assertions",

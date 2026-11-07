@@ -127,7 +127,8 @@ def main():
     # Run CBMC
     print("Running CBMC...")
     flags = [
-        "cbmc", "--function", "harness",
+        "cbmc", "--arch", "x86_64",
+        "--function", "harness",
         "--unwind", str(harness.unwind),
         "--unwinding-assertions",
         "--no-signed-overflow-check",

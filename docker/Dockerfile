@@ -1,12 +1,12 @@
-# equiv-env Docker image
+# equiv-env Docker image — target: x86-64 Linux
 # Ubuntu 24.04 with pinned gcc, clang, CBMC, Python 3, valgrind
 #
-# Build:
-#   docker build -t equiv-env -f docker/Dockerfile .
+# Build (from repo root):
+#   docker build --platform linux/amd64 -t equiv-env -f docker/Dockerfile .
 # Run:
-#   docker run -it --rm -v $(pwd):/workspace equiv-env bash
+#   docker run --platform linux/amd64 -it --rm -v $(pwd):/workspace equiv-env bash
 
-FROM ubuntu:24.04
+FROM --platform=linux/amd64 ubuntu:24.04
 
 # Prevent interactive prompts
 ENV DEBIAN_FRONTEND=noninteractive
@@ -33,7 +33,7 @@ RUN update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
     && update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
 
 # Install CBMC from GitHub releases
-# Pin: CBMC 6.11.0 for Ubuntu 24.04
+# Pin: CBMC 6.11.0 for Ubuntu 24.04, x86-64
 ARG CBMC_VERSION=6.11.0
 ARG CBMC_DEB=ubuntu-24.04-cbmc-${CBMC_VERSION}-Linux.deb
 RUN curl -L -o /tmp/${CBMC_DEB} \
@@ -59,12 +59,18 @@ RUN pip install --no-cache-dir \
 # Working directory
 WORKDIR /workspace
 
-# Smoke test: copy golden tests and run
+# Smoke tests (x86-64 specific flags: -fsigned-char, CBMC --arch x86_64)
 COPY tests/golden/000_smoke/ /tmp/smoke/
-RUN cbmc --function harness /tmp/smoke/test_equiv.c \
+RUN cbmc --arch x86_64 --function harness /tmp/smoke/test_equiv.c \
     && echo "Smoke test (equiv): PASS" \
-    && cbmc --function harness --trace /tmp/smoke/test_neq.c 2>&1 | grep -q "VERIFICATION FAILED" \
+    && cbmc --arch x86_64 --function harness --trace /tmp/smoke/test_neq.c 2>&1 | grep -q "VERIFICATION FAILED" \
     && echo "Smoke test (neq): PASS" \
     || (echo "Smoke test FAILED" && exit 1)
+
+# Char signedness test: must pass on x86-64 with -fsigned-char
+COPY tests/golden/001_char_signedness/ /tmp/char_signedness/
+RUN cbmc --arch x86_64 --function harness /tmp/char_signedness/test.c \
+    && echo "Char signedness test: PASS" \
+    || (echo "Char signedness test FAILED" && exit 1)
 
 CMD ["bash"]

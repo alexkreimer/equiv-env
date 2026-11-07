@@ -99,3 +99,20 @@ During self-equivalence checking (original vs identical copy), signed overflow i
 ## Decision 9 — Pointer loop functions are filtered at CBMC time
 
 Functions that loop over pointer buffers without explicit size parameters (strcpy-style `while(*d++ = *s++)`) fail self-equivalence within MAXN=8 because CBMC detects out-of-bounds pointer dereferences. These are implicitly filtered — they can't pass self-equivalence. Future: improve "string" pointer-rule detection to catch `while(*p)` and `for(; *p; p++)` patterns.
+
+## Decision 10 — Platform pinned to x86-64 (Task 1 of review)
+
+**Why:** char signedness differs between arm64 (unsigned by default) and x86-64 (signed). ExeBench was produced on x86. Silent disagreement between gcc, clang, and CBMC causes wrong rejections or wrong proofs.
+
+**Actions taken:**
+- Dockerfile targets `linux/amd64` (not arm64)
+- All CBMC calls use `--arch x86_64`
+- All gcc/clang compilation uses `-fsigned-char`
+- Golden test `001_char_signedness` added — function whose result depends on char signedness; must pass on x86-64 and fail on unsigned-char platforms
+- Dataset build, mutation study, and speed measurements must run on x86-64 Linux (cloud VM)
+
+## Decision 11 — Signed overflow: self-equiv only (Task 2)
+
+**R1 spec:** `--signed-overflow-check` may be turned off ONLY for self-equivalence. Candidate checks always run with all safety checks.
+
+**Implemented:** `verify()` uses default CBMC flags (all checks ON). `self_verify()` and the demo script may add `--no-signed-overflow-check` as an `extra_cbmc_flags`. Candidate checks through `evaluate()` must NOT pass this flag. The UB-in-original filter is still pending.

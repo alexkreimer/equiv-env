@@ -328,7 +328,7 @@ def _compile_and_run(
     # Compile
     try:
         result = subprocess.run(
-            ["gcc", "-O0", "-o", driver_path + ".out", driver_path],
+            ["gcc", "-O0", "-fsigned-char", "-o", driver_path + ".out", driver_path],
             capture_output=True, text=True, timeout=10,
         )
     except subprocess.TimeoutExpired:
