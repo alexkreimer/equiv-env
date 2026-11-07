@@ -120,10 +120,11 @@ def build_dataset(
 
     # Determine split from path
     def get_split(path: str) -> str:
-        if "test" in path.lower():
+        basename = os.path.basename(path)
+        if "test" in basename.lower():
             return "test"
-        elif "valid" in path.lower():
-            return "valid"
+        elif "valid" in basename.lower():
+            return "test"  # add valid to test pool per Task C
         return "train"
 
     funnel = Counter()
