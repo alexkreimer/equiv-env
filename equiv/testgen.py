@@ -301,7 +301,7 @@ int main(void) {{
         if not ret_is_void:
             parts.append(f"    if (r_o != r_c) {{")
             parts.append(f'      printf("FAIL test {test_idx}: return mismatch\\\\n");')
-            parts.append(f"      n_failed++; goto next_test; }}")
+            parts.append(f"      n_failed++; goto next_test_{test_idx}; }}")
 
         # Check buffers
         for name, c_type in sig.params:
@@ -309,9 +309,9 @@ int main(void) {{
                 parts.append(f"    for (int __i = 0; __i < MAXN; __i++) {{")
                 parts.append(f"      if ({name}_o[__i] != {name}_c[__i]) {{")
                 parts.append(f'        printf("FAIL test {test_idx}: buffer {name} mismatch at %d\\\\n", __i);')
-                parts.append(f"        n_failed++; goto next_test; }}}}")
+                parts.append(f"        n_failed++; goto next_test_{test_idx}; }}}}")
 
-        parts.append(f"    next_test: ;")
+        parts.append(f"    next_test_{test_idx}: ;")
         parts.append(f"  }}")
 
     parts.append(f'  printf("%d/%d tests passed\\\\n", n_tests - n_failed, n_tests);')
