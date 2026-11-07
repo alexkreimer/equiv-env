@@ -41,6 +41,8 @@ class EvalResult:
     check_time_s: float = 0.0
     test_result: dict | None = None
     verify_result: dict | None = None
+    overlap_check: str = "not_applicable"  # "passed" | "failed" | "not_applicable" | "skipped_original_ub"
+    near_identical: bool = False
     details: str = ""
 
 
@@ -168,19 +170,23 @@ def evaluate(
     return result
 
 
-def reward(r: EvalResult, cap: float = 4.0, base: float = 0.1) -> float:
+def reward(r: EvalResult, cap: float = 4.0, min_gain: float = 1.05,
+           base: float = 0.0) -> float:
     """Compute reward from evaluation result.
 
-    Reward structure:
+    [R1] Reward structure:
         - Not proven: 0.0
-        - Proven but not faster: base (0.1)
-        - Proven and faster: base + min(speedup, cap) - 1.0
+        - near_identical (copy/cosmetic rewrite): 0.0
+        - Proven but below min_gain: base (default 0)
+        - Proven and faster: min(speedup, cap) - 1.0
     """
     if r.status != "proven":
         return 0.0
-    if r.speedup <= 1.0:
+    if r.near_identical:
+        return 0.0
+    if r.speedup < min_gain:
         return base
-    return base + min(r.speedup, cap) - 1.0
+    return min(r.speedup, cap) - 1.0
 
 
 def _cache_put(task_id: str, candidate_src: str, result: EvalResult):

@@ -493,3 +493,130 @@ def generate_self_harness(task: Task, maxn: int = 8, unwind: int | None = None) 
     Used for the self-equivalence check during dataset building.
     """
     return generate_harness(task, task.func_src, maxn=maxn, unwind=unwind)
+
+
+def generate_overlap_harness(task: Task, candidate_src: str,
+                              maxn: int = 8, unwind: int | None = None) -> HarnessResult | None:
+    """Generate an overlap-sensitivity harness.
+
+    For tasks with >=2 pointer params of compatible type and no restrict,
+    creates a harness where those pointers share one buffer at symbolic offsets.
+    Returns None if the task doesn't need an overlap check.
+
+    R1 spec Step 3 item 5.
+    """
+    if unwind is None:
+        unwind = maxn + 2
+
+    sig = task.signature
+    pointer_params = [(name, c_type) for name, c_type in sig.params if c_type.endswith("*")]
+
+    if len(pointer_params) < 2:
+        return None
+
+    # Check if the original declares restrict — if so, no overlap check needed
+    if "restrict" in task.func_src:
+        return None
+
+    # Check compatible types (same pointee)
+    pointees = [_pointee_type(t) for _, t in pointer_params]
+    if len(set(pointees)) > 1:
+        # Different pointee types — overlap doesn't make sense
+        return None
+
+    pointee = pointees[0]
+
+    parts = []
+    parts.append(HEADER)
+    parts.append(f"#define MAXN {maxn}")
+    parts.append(f"/* Overlap harness — all {len(pointer_params)} pointers share one buffer */")
+
+    if task.deps_src:
+        filtered = _filter_deps(task.deps_src)
+        if filtered:
+            parts.append(filtered)
+
+    parts.append(NONDET_DECLS)
+
+    # Rename functions
+    orig_renamed = _rename_function(task.func_src, task.func_name, f"orig__{task.func_name}")
+    if orig_renamed is None:
+        orig_renamed = task.func_src
+    parts.append(orig_renamed)
+
+    cand_name = _extract_function_name(candidate_src) or task.func_name
+    cand_renamed = _rename_function(candidate_src, cand_name, f"cand__{task.func_name}")
+    if cand_renamed is None:
+        cand_renamed = candidate_src
+    parts.append(cand_renamed)
+
+    # Harness
+    parts.append("void harness(void) {")
+
+    # Scalar params
+    scalar_params = [(name, c_type) for name, c_type in sig.params if not c_type.endswith("*")]
+    for name, c_type in scalar_params:
+        nondet_call = _nondet_for_type(c_type)
+        if nondet_call:
+            parts.append(f"  {c_type} {name} = {nondet_call};")
+        else:
+            parts.append(f"  {c_type} {name} = ({c_type})nondet_int();")
+
+    # Shared buffer: double the size to accommodate offsets
+    parts.append(f"")
+    parts.append(f"  /* Shared buffer: all pointers alias into one array */")
+    parts.append(f"  {pointee} shared_o[MAXN * 2];")
+    parts.append(f"  {pointee} shared_c[MAXN * 2];")
+    parts.append(f"  for (int __i = 0; __i < MAXN * 2; __i++) {{")
+    parts.append(f"    shared_o[__i] = ({pointee})nondet_int();")
+    parts.append(f"    shared_c[__i] = shared_o[__i];")
+    parts.append(f"  }}")
+
+    # Symbolic offsets for each pointer into the shared buffer
+    pointer_names = [name for name, _ in pointer_params]
+    for idx, name in enumerate(pointer_names):
+        if idx == 0:
+            parts.append(f"  {pointee} *{name}_o = shared_o;")
+            parts.append(f"  {pointee} *{name}_c = shared_c;")
+        else:
+            parts.append(f"  int __off_{idx} = nondet_int();")
+            parts.append(f"  __CPROVER_assume(__off_{idx} >= 0 && __off_{idx} <= MAXN);")
+            parts.append(f"  {pointee} *{name}_o = shared_o + __off_{idx};")
+            parts.append(f"  {pointee} *{name}_c = shared_c + __off_{idx};")
+
+    # Call both
+    parts.append("")
+    parts.append("  /* Call original and candidate on shared buffers */")
+    orig_args = []
+    cand_args = []
+    for name, c_type in sig.params:
+        if c_type.endswith("*"):
+            orig_args.append(f"{name}_o")
+            cand_args.append(f"{name}_c")
+        else:
+            orig_args.append(name)
+            cand_args.append(name)
+
+    ret_void = sig.return_type == "void"
+    if not ret_void:
+        parts.append(f"  {sig.return_type} __r_o = orig__{task.func_name}({', '.join(orig_args)});")
+        parts.append(f"  {sig.return_type} __r_c = cand__{task.func_name}({', '.join(cand_args)});")
+        parts.append(f"  assert(__r_o == __r_c);")
+    else:
+        parts.append(f"  orig__{task.func_name}({', '.join(orig_args)});")
+        parts.append(f"  cand__{task.func_name}({', '.join(cand_args)});")
+
+    # Compare shared buffers
+    parts.append(f"  for (int __i = 0; __i < MAXN * 2; __i++) {{")
+    parts.append(f"    assert(shared_o[__i] == shared_c[__i]);")
+    parts.append(f"  }}")
+
+    parts.append("}")
+
+    return HarnessResult(
+        harness_src="\n".join(parts),
+        original_func_name=f"orig__{task.func_name}",
+        candidate_func_name=f"cand__{task.func_name}",
+        maxn=maxn,
+        unwind=unwind,
+    )
