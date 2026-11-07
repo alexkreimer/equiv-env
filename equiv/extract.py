@@ -242,11 +242,9 @@ def _infer_pointer_rules(signature: Signature, func_body: str) -> dict[str, str]
         if paired:
             rules[name] = "paired"
         elif is_char_ptr:
-            # Check if it's used as a string (strlen, strcmp, or loop-until-'\\0')
-            if any(f in func_body for f in ("strlen", "strcmp", "strncmp", "strcpy")):
-                rules[name] = "string"
-            else:
-                rules[name] = "fixed"
+            # [R1] Every char* without a length param gets a null terminator
+            # at a symbolic position < MAXN. No need to detect string usage.
+            rules[name] = "string"
         else:
             rules[name] = "fixed"
 
