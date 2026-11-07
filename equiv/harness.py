@@ -453,16 +453,18 @@ def _rename_function(src: str, old_name: str, new_name: str) -> str | None:
 
 def _extract_function_name(src: str) -> str | None:
     """Extract the function name from C source code."""
-    # Match: optional keywords + return type + function_name + (
-    # Typical pattern: "static int func_name(" or "void func_name("
     stripped = src.strip()
 
-    # Remove leading decorators
-    for prefix in ("static ", "inline ", "extern ", "__attribute__((used)) "):
+    # Remove leading decorators and attributes
+    # First strip common storage class prefixes
+    for prefix in ("static ", "inline ", "extern "):
         if stripped.startswith(prefix):
             stripped = stripped[len(prefix):]
 
-    # Split on first '('
+    # Strip __attribute__((...)) specifiers (any content inside the double parens)
+    stripped = re.sub(r'__attribute__\s*\(\([^)]*(?:\)\))?', '', stripped).strip()
+
+    # Split on first '(' to find the function name
     paren_idx = stripped.find("(")
     if paren_idx == -1:
         return None

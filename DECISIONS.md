@@ -91,3 +91,11 @@ Additional discoveries:
 **Reality:** ExeBench uses a legacy builder script (`exebench.py`). `datasets>=5.0` dropped script support. Even `datasets<3.0` with script support downloads ALL tar archives (8GB+) even for small splits. Streaming mode doesn't support tar extraction.
 
 **Decision:** Download tar.gz files directly from Hugging Face LFS storage, extract, and read zst-compressed JSONL with a custom streaming reader. The `extract.py` module will handle this directly using Python's `tarfile`, `zstandard`, and `json` modules. Add `zstandard` to pyproject.toml dependencies.
+
+## Decision 8 — Self-equivalence: disable signed overflow for self-check
+
+During self-equivalence checking (original vs identical copy), signed overflow is deterministic — both copies overflow identically. We disable `--signed-overflow-check` for the self-equivalence step. The separate UB-in-original filter step runs with all checks ON.
+
+## Decision 9 — Pointer loop functions are filtered at CBMC time
+
+Functions that loop over pointer buffers without explicit size parameters (strcpy-style `while(*d++ = *s++)`) fail self-equivalence within MAXN=8 because CBMC detects out-of-bounds pointer dereferences. These are implicitly filtered — they can't pass self-equivalence. Future: improve "string" pointer-rule detection to catch `while(*p)` and `for(; *p; p++)` patterns.
