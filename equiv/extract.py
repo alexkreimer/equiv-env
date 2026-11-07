@@ -72,15 +72,14 @@ REASON_UNSUPPORTED_TYPE = "unsupported_type"  # float, struct, union, etc.
 REASON_FORBIDDEN_CONSTRUCT = "forbidden_construct"  # inline asm, varargs, etc.
 REASON_NO_SIGNATURE = "no_signature"
 REASON_VOID_PARAMS = "void_params"  # function takes no parameters
+REASON_LIBC_NOT_MODELED = "libc_not_modeled"  # calls memset/memcpy/strlen etc. not modeled
 REASON_PARSE_ERROR = "parse_error"
 
 
-# ---- Allow-listed libc functions ---- 
-ALLOWED_LIBC_CALLS = {
-    "abs", "labs", "llabs",
-    "memcpy", "memset", "memcmp", "memmove",
-    "strlen", "strcmp", "strncmp", "strcpy", "strncpy",
-}
+# Allow-listed libc functions — currently empty: CBMC 6.11.0 does not model
+# memset, memcpy, memcmp, strlen, strcmp, strncmp reliably.
+# See DECISIONS.md Decision 12.
+ALLOWED_LIBC_CALLS: set[str] = set()
 
 
 # ---- Type classification ----
@@ -389,6 +388,13 @@ def _check_eligibility(record: dict, split: str) -> Eligibility:
             continue
         if fn_name in ALLOWED_LIBC_CALLS:
             continue
+        # Check if it's a libc function we don't model
+        _LIBC_FUNCTIONS = {"memcpy", "memset", "memcmp", "memmove",
+                           "strlen", "strcmp", "strncmp", "strcpy", "strncpy",
+                           "abs", "labs", "llabs", "malloc", "free",
+                           "printf", "scanf", "fopen", "fread", "fwrite"}
+        if fn_name in _LIBC_FUNCTIONS:
+            return Eligibility(eligible=False, reason_code=REASON_LIBC_NOT_MODELED)
         # If the function calls anything else, reject
         return Eligibility(eligible=False, reason_code=REASON_CALLS_EXTERNAL)
 
@@ -546,19 +552,24 @@ def _extract_called_functions(func_body: str) -> set[str]:
 
 
 def _extract_io_tests(exebench_record: dict) -> list[dict] | None:
-    """Extract IO test cases from ExeBench record if available."""
+    """Extract IO test cases from ExeBench record — inputs only.
+
+    Per C2: Do NOT use ExeBench stored outputs as expected answers.
+    They were produced on x86 and may disagree with locally computed outputs.
+    Use inputs only; expected outputs are computed by running the original
+    on the same machine as the candidate.
+    """
     io_pairs = exebench_record.get("angha_io_pairs")
     if not io_pairs:
         return None
 
-    # Convert ExeBench IO format to our test format
     tests = []
     for pair in io_pairs:
-        test = {
-            "input": pair.get("input", {}),
-            "output": pair.get("output", {}),
-        }
-        tests.append(test)
+        # Extract input only, discard stored output
+        inp = pair.get("input", {})
+        if inp:
+            tests.append({"input": inp})
+
     return tests if tests else None
 
 

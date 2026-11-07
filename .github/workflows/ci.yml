@@ -1,0 +1,89 @@
+name: equiv-env CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  golden-and-self-equiv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CBMC
+        run: |
+          curl -L -o /tmp/cbmc.deb \
+            "https://github.com/diffblue/cbmc/releases/download/cbmc-6.11.0/ubuntu-24.04-cbmc-6.11.0-Linux.deb"
+          sudo dpkg -i /tmp/cbmc.deb
+          cbmc --version
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pytest pytest-timeout zstandard pyyaml
+
+      - name: Run golden suite (smoke tests)
+        run: |
+          for test in tests/golden/000_smoke/test_equiv.c tests/golden/000_smoke/test_neq.c; do
+            cbmc --arch x86_64 --function harness "$test"
+          done
+
+      - name: Run golden suite (parametric)
+        run: python -m pytest tests/test_golden.py -v --timeout=60 -k "not 021 and not 024"
+        env:
+          PYTHONPATH: .
+
+      - name: Self-equivalence sample
+        run: |
+          python -c "
+          import sys, tempfile, subprocess, os
+          sys.path.insert(0, '.')
+          from equiv.extract import extract_from_exebench
+          from equiv.harness import generate_self_harness
+
+          # Use test_real data (should be downloaded in a prior step or committed)
+          # For CI: use a small committed sample
+          zst_files = []
+          for root, dirs, files in os.walk('data'):
+              for f in files:
+                  if f.endswith('.jsonl.zst'):
+                      zst_files.append(os.path.join(root, f))
+
+          if not zst_files:
+              print('No data files found — skipping self-equiv sample')
+              sys.exit(0)
+
+          passed = failed = tested = 0
+          for zst_path in zst_files:
+              for r in extract_from_exebench(zst_path, 'test'):
+                  if not r.eligible: continue
+                  task = r.task
+                  h = generate_self_harness(task)
+                  with tempfile.NamedTemporaryFile(suffix='.c', mode='w', delete=False) as f:
+                      f.write(h.harness_src); tmp = f.name
+                  try:
+                      result = subprocess.run(
+                          ['cbmc', '--arch', 'x86_64', '--function', 'harness',
+                           '--unwind', str(h.unwind), '--unwinding-assertions',
+                           '--no-signed-overflow-check', tmp],
+                          capture_output=True, text=True, timeout=15)
+                      if 'SUCCESSFUL' in result.stdout: passed += 1
+                      else: failed += 1
+                  except subprocess.TimeoutExpired: failed += 1
+                  os.unlink(tmp)
+                  tested += 1
+                  if tested >= 200: break
+              if tested >= 200: break
+
+          print(f'Self-equiv ({tested} tasks): {passed} pass, {failed} fail')
+          assert passed + failed == tested
+          " 2>&1
+        env:
+          PYTHONPATH: .

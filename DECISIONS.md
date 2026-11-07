@@ -116,3 +116,9 @@ Functions that loop over pointer buffers without explicit size parameters (strcp
 **R1 spec:** `--signed-overflow-check` may be turned off ONLY for self-equivalence. Candidate checks always run with all safety checks.
 
 **Implemented:** `verify()` uses default CBMC flags (all checks ON). `self_verify()` and the demo script may add `--no-signed-overflow-check` as an `extra_cbmc_flags`. Candidate checks through `evaluate()` must NOT pass this flag. The UB-in-original filter is still pending.
+
+## Decision 12 — Libc functions removed from allow-list (Task B)
+
+CBMC 6.11.0 on macOS arm64 with `--arch x86_64` does not model `memset`, `memcmp`, `strlen`, or `strcmp` reliably — all four fail when compared against equivalent loop implementations in dedicated golden harnesses. Rather than risk false proofs from unmodeled library functions, all libc functions are removed from the allow-list for v1. Functions that call any of these get rejection reason `libc_not_modeled`.
+
+The two golden tests (021_memset_zero, 024_memcmp_builtin) that tested equivalence against libc builtins are removed from the passing set. If CBMC adds reliable models in a future version, these can be re-enabled.
