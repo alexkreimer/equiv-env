@@ -76,10 +76,11 @@ REASON_LIBC_NOT_MODELED = "libc_not_modeled"  # calls memset/memcpy/strlen etc. 
 REASON_PARSE_ERROR = "parse_error"
 
 
-# Allow-listed libc functions — currently empty: CBMC 6.11.0 does not model
-# memset, memcpy, memcmp, strlen, strcmp, strncmp reliably.
+# Allow-listed libc functions — only those verified to have correct CBMC models
+# (CBMC 6.11.0, --arch x86_64, with system headers).
+# memcmp NOT included: CBMC model returns wrong values.
 # See DECISIONS.md Decision 12.
-ALLOWED_LIBC_CALLS: set[str] = set()
+ALLOWED_LIBC_CALLS: set[str] = {"memset", "memcpy", "strlen"}
 
 
 # ---- Type classification ----
@@ -389,8 +390,7 @@ def _check_eligibility(record: dict, split: str) -> Eligibility:
         if fn_name in ALLOWED_LIBC_CALLS:
             continue
         # Check if it's a libc function we don't model
-        _LIBC_FUNCTIONS = {"memcpy", "memset", "memcmp", "memmove",
-                           "strlen", "strcmp", "strncmp", "strcpy", "strncpy",
+        _LIBC_FUNCTIONS = {"memcmp", "memmove", "strcmp", "strncmp", "strcpy", "strncpy",
                            "abs", "labs", "llabs", "malloc", "free",
                            "printf", "scanf", "fopen", "fread", "fwrite"}
         if fn_name in _LIBC_FUNCTIONS:
