@@ -8,7 +8,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from equiv.extract import extract_from_exebench
+from equiv.extract import extract_from_exebench, Task, Signature
 from equiv.harness import generate_harness, _filter_deps, HEADER, _rename_function
 from equiv.verify import verify
 from equiv.mutate import mutate
@@ -150,17 +150,37 @@ def run_single_mutant(args) -> MutantResult:
     return r
 
 
-def run_mutation_study(n_tasks=500, mutants_per_task=3, n_workers=1, data_dir=None):
-    if data_dir is None: data_dir = DATA_DIR
-    zst_files = find_zst_files(data_dir)
-    if not zst_files: print("No data files found."); return
-
-    tasks = []
-    for zst_path in zst_files:
-        for result in extract_from_exebench(zst_path, "test"):
-            if result.eligible: tasks.append(result.task)
+def run_mutation_study(n_tasks=500, mutants_per_task=3, n_workers=1, data_dir=None, tasks_jsonl=None):
+    if tasks_jsonl:
+        import json as _json
+        tasks = []
+        with open(tasks_jsonl) as f:
+            for line in f:
+                d = _json.loads(line)
+                sig_d = d["signature"]
+                sig = Signature(name=sig_d["name"], return_type=sig_d["return_type"], params=[tuple(p) for p in sig_d["params"]])
+                task = Task(
+                    task_id=d["task_id"], source=d.get("source", "exebench"), split=d.get("split", "train"),
+                    func_name=d["func_name"], func_src=d["func_src"], deps_src=d.get("deps_src", ""),
+                    signature=sig, pointer_rules=d.get("pointer_rules", []),
+                    maxn=d.get("maxn", 8), unwind=d.get("unwind", 10),
+                    n_loops=d.get("n_loops", 0), loc=d.get("loc", 0),
+                    io_tests=d.get("io_tests"), input_ranges=d.get("input_ranges"),
+                    self_check_time_s=d.get("self_check_time_s", 0.0),
+                )
+                tasks.append(task)
+                if len(tasks) >= n_tasks:
+                    break
+    else:
+        if data_dir is None: data_dir = DATA_DIR
+        zst_files = find_zst_files(data_dir)
+        if not zst_files: print("No data files found."); return
+        tasks = []
+        for zst_path in zst_files:
+            for result in extract_from_exebench(zst_path, "test"):
+                if result.eligible: tasks.append(result.task)
+                if len(tasks) >= n_tasks: break
             if len(tasks) >= n_tasks: break
-        if len(tasks) >= n_tasks: break
 
     print(f"Running mutation study on {len(tasks)} tasks, {mutants_per_task} mutants each...")
     all_mutants = []
@@ -206,5 +226,6 @@ if __name__ == "__main__":
     p.add_argument("--mutants-per-task", type=int, default=3)
     p.add_argument("--n-workers", type=int, default=1)
     p.add_argument("--data-dir", type=str, default=None)
+    p.add_argument("--tasks-jsonl", type=str, default=None)
     args = p.parse_args()
-    run_mutation_study(args.n_tasks, args.mutants_per_task, args.n_workers, args.data_dir)
+    run_mutation_study(args.n_tasks, args.mutants_per_task, args.n_workers, args.data_dir, args.tasks_jsonl)
