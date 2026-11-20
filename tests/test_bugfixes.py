@@ -68,6 +68,28 @@ def test_ub_check_passes_for_string_loop():
     assert res.status == "proven", f"Expected proven, got {res.status}: {res.details}"
 
 
+def test_ub_check_and_self_equiv_for_pointer_return_string_loop():
+    """Bug 2a + pointer return: `char *to_unix_path(char *p)` passes UB + self-equiv."""
+    rec = _make_record(
+        func_head="char *to_unix_path(char *p)",
+        func_def=(
+            "char *to_unix_path(char *p) {\n"
+            "  char *pp = p;\n"
+            "  while (*pp != 0) { if (*pp == '\\\\') *pp = '/'; ++pp; }\n"
+            "  return p;\n"
+            "}"
+        ),
+        fname="to_unix_path",
+    )
+    elig = _check_eligibility(rec, "train")
+    assert elig.eligible
+    ub_free, _ = check_original_ub(elig.task, timeout_s=30, maxn=8)
+    assert ub_free, "to_unix_path falsely rejected as ub_in_original"
+
+    res = self_verify(elig.task, timeout_s=30, maxn=8, extra_cbmc_flags=["--no-signed-overflow-check"])
+    assert res.status == "proven", f"Expected proven for pointer return, got {res.status}: {res.details}"
+
+
 def test_paired_array_length_passes_ub_and_self_equiv():
     """Bug 2b & Bug 3: `sum_arr(int *a, int n)` gets `0 <= n <= MAXN` in both UB and main harness."""
     rec = _make_record(
