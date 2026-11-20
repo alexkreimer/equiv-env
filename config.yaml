@@ -13,7 +13,15 @@ dataset:
   allowed_libc:
     - memset
     - memcpy
+    - memmove
     - strlen
+    - strcmp
+    - strncmp
+    - strcpy
+    - strchr
+    - abs
+    - labs
+    - llabs
   excluded_path_patterns:
     # Compiler regression testsuites (tiny codegen micro-tests, heavy near-duplicates)
     - gcc/testsuite
