@@ -56,7 +56,9 @@ HEADER = """
 #include <assert.h>
 #include <stdint.h>
 #include <stddef.h>
-#include <stdbool.h>
+/* No stdbool.h — ExeBench deps often typedef int bool;
+   stdbool.h would #define bool _Bool, turning the typedef
+   into "typedef int _Bool" which is illegal (C keyword). */
 #include <string.h>
 #include <stdlib.h>
 """
@@ -153,7 +155,27 @@ def _pointee_type(ptr_type: str) -> str:
 
 
 def _filter_deps(deps: str) -> str:
-    """Filter dependency text: strip #include lines, keep typedefs/structs/defines."""
+    """Filter dependency text: strip #include lines and redefinitions of types
+    already provided by our standard headers (<stdint.h>, <stddef.h>, <string.h>)."""
+    # Types already defined by the headers we include — strip their redefinitions
+    REDEFINED_TYPES = {
+        "size_t", "ssize_t", "intptr_t", "uintptr_t", "ptrdiff_t",
+        "int8_t", "uint8_t", "int16_t", "uint16_t", "int32_t", "uint32_t",
+        "int64_t", "uint64_t", "intmax_t", "uintmax_t",
+        "int_fast8_t", "uint_fast8_t", "int_fast16_t", "uint_fast16_t",
+        "int_fast32_t", "uint_fast32_t", "int_fast64_t", "uint_fast64_t",
+        "int_least8_t", "uint_least8_t", "int_least16_t", "uint_least16_t",
+        "int_least32_t", "uint_least32_t", "int_least64_t", "uint_least64_t",
+        "NULL",
+    }
+    # Function prototypes already declared by <string.h> / <stdlib.h>
+    REDEFINED_FUNCS = {
+        "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strncat",
+        "memcmp", "memcpy", "memmove", "memset", "memchr",
+        "malloc", "free", "calloc", "realloc",
+    }
+
+    import re as _re
     lines = deps.split("\n")
     filtered = []
     for line in lines:
@@ -161,8 +183,15 @@ def _filter_deps(deps: str) -> str:
         # Skip #include lines
         if stripped.startswith("#include"):
             continue
-        # Skip empty/whitespace-only lines
         if not stripped:
+            continue
+        # Skip typedef redefinitions of types we already have
+        m = _re.match(r'typedef\s+.+\s+(\w+)\s*;', stripped)
+        if m and m.group(1) in REDEFINED_TYPES:
+            continue
+        # Skip function declarations of functions we already have
+        m = _re.match(r'(?:extern\s+)?[\w\s*]+\s+(\w+)\s*\(', stripped)
+        if m and m.group(1) in REDEFINED_FUNCS:
             continue
         filtered.append(line)
     return "\n".join(filtered)
