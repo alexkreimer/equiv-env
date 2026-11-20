@@ -95,8 +95,13 @@ EXCLUDED_PATH_PATTERNS: tuple[str, ...] = tuple(
 
 INTEGER_TYPES = {
     "char", "short", "int", "long", "long long",
-    "signed char", "unsigned char", "unsigned short",
-    "unsigned int", "unsigned long", "unsigned long long",
+    "signed", "unsigned",
+    "signed char", "unsigned char",
+    "signed short", "unsigned short", "short int", "signed short int", "unsigned short int",
+    "signed int", "unsigned int",
+    "signed long", "unsigned long", "long int", "signed long int", "unsigned long int",
+    "signed long long", "unsigned long long",
+    "long long int", "signed long long int", "unsigned long long int",
     # stdint types
     "int8_t", "int16_t", "int32_t", "int64_t",
     "uint8_t", "uint16_t", "uint32_t", "uint64_t",
@@ -113,22 +118,30 @@ FORBIDDEN_TYPES = {
     "float", "double", "long double",
 }
 
+_TYPE_QUALIFIERS_RE = re.compile(
+    r'\b(?:const|volatile|restrict|__restrict__|__restrict|register)\b'
+)
+
+
+def _clean_type_str(typ: str) -> str:
+    """Strip C type/storage qualifiers and normalize whitespace."""
+    cleaned = _TYPE_QUALIFIERS_RE.sub("", typ)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
 
 def _is_integer_type(typ: str) -> bool:
     """Check if a type string represents an integer scalar type."""
-    # Strip const, volatile, restrict qualifiers
-    clean = typ.replace("const ", "").replace("volatile ", "").replace("restrict ", "").strip()
-    # Check if it's in our known integer set
-    if clean in INTEGER_TYPES:
-        return True
-    # Check for typedef'd integer types (like int32_t, custom names)
-    # For now, only exact matches; we'll refine with clang AST
-    return False
+    clean = _clean_type_str(typ)
+    return clean in INTEGER_TYPES
 
 
 def _is_pointer_to_integer(typ: str) -> tuple[bool, str]:
-    """Check if type is/contains a pointer to integer types. Returns (is_ptr_to_int, pointee_type)."""
-    clean = typ.replace("const ", "").replace("volatile ", "").replace("restrict ", "").strip()
+    """Check if type is a single pointer to an integer type. Returns (is_ptr_to_int, pointee_type)."""
+    clean = _clean_type_str(typ)
+    # Reject double pointers (e.g. int **, char * *)
+    if clean.count("*") != 1:
+        return False, ""
     if clean.endswith("*"):
         pointee = clean[:-1].strip()
         if _is_integer_type(pointee):
@@ -138,12 +151,9 @@ def _is_pointer_to_integer(typ: str) -> tuple[bool, str]:
 
 def _is_forbidden_type(typ: str) -> bool:
     """Check if type contains forbidden types (float, struct, etc.)."""
-    clean = typ.replace("const ", "").replace("volatile ", "").replace("restrict ", "").strip()
-    # Check for struct/union keywords
+    clean = _clean_type_str(typ)
     if "struct " in clean or "union " in clean or "enum " in clean:
         return True
-    # Check for typedef'd struct references (capitalized types that aren't in our integer set)
-    # This is a heuristic — we'll validate with clang AST
     for word in clean.replace("*", " ").split():
         if word in FORBIDDEN_TYPES:
             return True
@@ -213,14 +223,57 @@ def _detect_forbidden_constructs(func_body: str) -> str | None:
     return None
 
 
+LENGTH_PARAM_NAMES = {"n", "len", "length", "size", "count", "num", "sz", "cnt"}
+LENGTH_PARAM_SUFFIXES = ("_len", "_size", "_n", "_count", "_num", "_sz")
+LENGTH_PARAM_PREFIXES = ("len_", "num_", "n_")
+
+
+def _is_length_param_name(name: str) -> bool:
+    """Return True if a scalar parameter name looks like a buffer length/size."""
+    lower = name.lower()
+    if lower in LENGTH_PARAM_NAMES:
+        return True
+    if any(lower.endswith(s) for s in LENGTH_PARAM_SUFFIXES):
+        return True
+    if any(lower.startswith(p) for p in LENGTH_PARAM_PREFIXES):
+        return True
+    return False
+
+
+def get_paired_length_params(signature: Signature, pointer_rules: dict | None = None) -> set[str]:
+    """Return scalar parameter names that act as buffer lengths for pointer params.
+
+    Only returns scalar (non-pointer) parameters, and only when the signature
+    contains at least one pointer parameter (and, if pointer_rules is given,
+    at least one pointer has rule == 'paired').
+    """
+    has_pointer = any(typ.strip().endswith("*") for _, typ in signature.params)
+    if not has_pointer:
+        return set()
+    if pointer_rules is not None and "paired" not in pointer_rules.values():
+        return set()
+
+    paired_scalars = set()
+    for name, typ in signature.params:
+        if typ.strip().endswith("*"):
+            continue
+        if _is_length_param_name(name):
+            paired_scalars.add(name)
+    return paired_scalars
+
+
 def _infer_pointer_rules(signature: Signature, func_body: str) -> dict[str, str]:
     """Infer pointer sizing rules for each pointer parameter.
 
     Returns: {param_name: "paired" | "fixed" | "string"}
     """
     rules = {}
-    param_names = {name for name, _ in signature.params}
-    length_names = {"n", "len", "length", "size", "count", "num", "sz"}
+    # Find scalar (non-pointer) integer parameters that look like a length/size
+    length_scalars = [
+        other_name
+        for other_name, other_typ in signature.params
+        if not other_typ.strip().endswith("*") and _is_length_param_name(other_name)
+    ]
 
     for name, typ in signature.params:
         ptr_match = _is_pointer_to_integer(typ)
@@ -228,26 +281,9 @@ def _infer_pointer_rules(signature: Signature, func_body: str) -> dict[str, str]
             continue
 
         pointee = ptr_match[1]
-        # Check if this is char* used as string
-        is_char_ptr = pointee in ("char", "unsigned char")
+        is_char_ptr = pointee in ("char", "unsigned char", "signed char")
 
-        # Look for a paired length parameter
-        paired = False
-        for other_name, _ in signature.params:
-            if other_name == name:
-                continue
-            if other_name in length_names:
-                paired = True
-                break
-            # Also check if any param ends in _len, _size, _n
-            for suffix in ("_len", "_size", "_n", "_count", "_num"):
-                if other_name.endswith(suffix):
-                    paired = True
-                    break
-            if paired:
-                break
-
-        if paired:
+        if length_scalars:
             rules[name] = "paired"
         elif is_char_ptr:
             # [R1] Every char* without a length param gets a null terminator
@@ -261,10 +297,11 @@ def _infer_pointer_rules(signature: Signature, func_body: str) -> dict[str, str]
 
 def _count_loops(func_body: str) -> int:
     """Count loop constructs in the function body."""
+    stripped = _strip_comments(func_body)
     loops = 0
-    loops += len(re.findall(r'\bfor\s*\(', func_body))
-    loops += len(re.findall(r'\bwhile\s*\(', func_body))
-    loops += len(re.findall(r'\bdo\s*\{', func_body))
+    loops += len(re.findall(r'\bfor\s*\(', stripped))
+    loops += len(re.findall(r'\bwhile\s*\(', stripped))
+    loops += len(re.findall(r'\bdo\s*\{', stripped))
     return loops
 
 
@@ -273,6 +310,44 @@ def _count_loc(func_body: str) -> int:
     stripped = _strip_comments(func_body)
     lines = [l for l in stripped.split('\n') if l.strip()]
     return len(lines)
+
+
+def _extract_head_from_def(func_def: str) -> str | None:
+    """Extract the clean function signature header from func_def (before '{').
+
+    ExeBench's `func_head` field drops spaces in scalar parameters (e.g. `intn`,
+    `intlen`, `intsize`), causing false rejections. Parsing directly from
+    `func_def` avoids this. Returns None for K&R-style parameter lists so the
+    caller can fall back to `func_head`.
+    """
+    cleaned = _strip_comments(func_def)
+    brace_idx = cleaned.find("{")
+    if brace_idx == -1:
+        return None
+    head = re.sub(r'\s+', ' ', cleaned[:brace_idx]).strip()
+    if "(" not in head or ")" not in head:
+        return None
+
+    # Detect K&R-style parameter declarations after closing ')':
+    # e.g. `int same(w1, w2) short *w1; int *w2;`
+    open_idx = head.find("(")
+    depth = 0
+    close_idx = -1
+    for i in range(open_idx, len(head)):
+        if head[i] == "(":
+            depth += 1
+        elif head[i] == ")":
+            depth -= 1
+            if depth == 0:
+                close_idx = i
+                break
+    if close_idx == -1:
+        return None
+    trailing = head[close_idx + 1:].strip()
+    if ";" in trailing:
+        # K&R declaration list — let caller fall back to ExeBench's ANSI func_head
+        return None
+    return head[:close_idx + 1].strip()
 
 
 # ---- Main extraction ----
@@ -372,10 +447,19 @@ def _check_eligibility(
             if globals_list:
                 return Eligibility(eligible=False, reason_code=REASON_USES_GLOBALS)
 
-    # 3. Parse signature
-    sig = _parse_signature(func_head, func_def, fname)
+    # 3. Parse signature — prefer func_def over ExeBench's func_head, because
+    #    func_head drops spaces in scalar parameters (e.g. `intn`, `intlen`).
+    #    Fall back to func_head for K&R definitions or missing bodies.
+    def_head = _extract_head_from_def(func_def)
+    sig = _parse_signature(def_head, func_def, fname) if def_head else None
+    if sig is None:
+        sig = _parse_signature(func_head, func_def, fname)
     if sig is None:
         return Eligibility(eligible=False, reason_code=REASON_NO_SIGNATURE)
+
+    # Check for varargs in signature
+    if any(typ == "..." or name == "..." for name, typ in sig.params):
+        return Eligibility(eligible=False, reason_code=REASON_FORBIDDEN_CONSTRUCT)
 
     # 4. Check parameter types
     for name, typ in sig.params:
@@ -389,7 +473,7 @@ def _check_eligibility(
             return Eligibility(eligible=False, reason_code=REASON_UNSUPPORTED_TYPE)
 
     # 5. Check return type
-    ret = sig.return_type.strip()
+    ret = _clean_type_str(sig.return_type)
     if ret == "void":
         pass  # OK
     elif _is_integer_type(ret):
@@ -414,13 +498,16 @@ def _check_eligibility(
     allowed_set = ALLOWED_LIBC_CALLS if allowed_libc is None else set(allowed_libc)
     body_only = _get_body_only(func_def)
     called_fns = _extract_called_functions(body_only)
+    _SKIP_CALL_NAMES = {
+        "if", "while", "for", "return", "switch", "case", "sizeof",
+        "default", "break", "continue", "goto", "void", "char",
+        "int", "long", "short", "unsigned", "signed", "const",
+        "static", "inline", "typedef", "struct", "enum", "union",
+        "__attribute__", "__extension__", "__builtin", "typeof", "__typeof__",
+    } | {t for t in INTEGER_TYPES if " " not in t}
     for fn_name in called_fns:
-        # Skip CBMC builtins, C keywords, and attribute specifiers
-        if fn_name in ("if", "while", "for", "return", "switch", "case", "sizeof",
-                        "default", "break", "continue", "goto", "void", "char",
-                        "int", "long", "short", "unsigned", "signed", "const",
-                        "static", "inline", "typedef", "struct", "enum", "union",
-                        "__attribute__", "__extension__", "__builtin"):
+        # Skip CBMC builtins, C keywords, integer cast types, and attribute specifiers
+        if fn_name in _SKIP_CALL_NAMES:
             continue
         # Skip the function's own name (self-reference)
         if fn_name == fname:
@@ -458,10 +545,33 @@ def _check_eligibility(
     return Eligibility(eligible=True, task=task)
 
 
-def _parse_signature(func_head: str, func_def: str, fname: str) -> Signature | None:
-    """Parse function signature from func_head string.
+def _strip_attributes(text: str) -> str:
+    """Remove __attribute__((...)) blocks (handling nested parens)."""
+    out = text
+    while True:
+        m = re.search(r'__attribute__\s*\(\(', out)
+        if not m:
+            break
+        start = m.start()
+        i = m.end() - 2  # at first '('
+        depth = 0
+        while i < len(out):
+            if out[i] == "(":
+                depth += 1
+            elif out[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            i += 1
+        out = out[:start] + " " + out[i:]
+    return out
 
-    func_head examples:
+
+def _parse_signature(func_head: str, func_def: str, fname: str) -> Signature | None:
+    """Parse function signature from a C header string (from func_def or func_head).
+
+    Examples:
         "int sum(int a, int b)"
         "void reset(void)"
         "static int foo(char *s, size_t n)"
@@ -469,14 +579,16 @@ def _parse_signature(func_head: str, func_def: str, fname: str) -> Signature | N
 
     Returns Signature or None if parsing fails.
     """
-    head = func_head.strip()
-    # Remove storage class specifiers
-    for prefix in ("static ", "inline ", "extern ", "__attribute__((used)) "):
-        head = head.replace(prefix, "")
+    head = _strip_attributes(func_head.strip())
+    # Remove leading storage/inline specifiers
+    head = re.sub(
+        r'\b(?:static|inline|__inline__|__inline|extern|__extension__|__forceinline)\b',
+        ' ',
+        head,
+    )
+    head = re.sub(r'\s+', ' ', head).strip()
 
-    head = head.strip()
-
-    # Split into return type and function name+params
+    # Split into return type + function name, and params
     paren_idx = head.find("(")
     if paren_idx == -1:
         return None
@@ -484,27 +596,25 @@ def _parse_signature(func_head: str, func_def: str, fname: str) -> Signature | N
     before_paren = head[:paren_idx].strip()
     after_paren = head[paren_idx:]
 
-    # Extract return type (everything before the function name)
-    # The function name is the last word before the paren, but it might start with *
-    parts = before_paren.split()
+    # Separate stars cleanly so `char* foo` and `char *foo` both tokenize properly
+    before_spaced = re.sub(r'\*', ' * ', before_paren)
+    parts = before_spaced.split()
     if not parts:
         return None
 
-    func_name_with_star = parts[-1]
-    if func_name_with_star.startswith("*"):
-        # Pointer return: move * to return type
-        func_name = func_name_with_star[1:]
-        return_type = " ".join(parts[:-1]) + " *" if len(parts) > 1 else "*"
-    else:
-        func_name = func_name_with_star
-        return_type = " ".join(parts[:-1]) if len(parts) > 1 else "int"
+    func_name = parts[-1]
+    if not re.match(r'^[a-zA-Z_]\w*$', func_name):
+        return None
+    return_type = " ".join(parts[:-1]).strip() if len(parts) > 1 else "int"
+    # Normalize spaces before `*` (e.g. "const char *")
+    return_type = re.sub(r'\s+', ' ', return_type).strip()
 
     # Parse parameters from the paren section
     params_str = after_paren.strip()
     if not params_str.startswith("("):
         return None
 
-    # Extract content between parentheses
+    # Extract content between outer parentheses
     depth = 0
     param_str = ""
     for ch in params_str:
@@ -525,33 +635,59 @@ def _parse_signature(func_head: str, func_def: str, fname: str) -> Signature | N
     params = []
     if param_str.strip() and param_str.strip() != "void":
         raw_params = _split_params(param_str)
-        for rp in raw_params:
+        for idx, rp in enumerate(raw_params):
             rp = rp.strip()
             if not rp:
                 continue
-            # Split type and name: last token is name, rest is type
-            tokens = rp.split()
-            if len(tokens) >= 2:
-                param_name = tokens[-1].rstrip("[]")
-                param_type = " ".join(tokens[:-1])
-                # Handle pointer: if name starts with *, move it to type
-                while param_name.startswith("*"):
-                    param_name = param_name[1:]
-                    param_type += " *"
-                # Handle array syntax: int arr[] -> int *
-                if "[" in rp and "]" in rp:
-                    if not param_type.endswith("*"):
-                        param_type += " *"
-                params.append((param_name, param_type))
-            elif len(tokens) == 1:
-                # Unnamed parameter
-                param_name = tokens[0]
-                param_type = tokens[0]
-                # Handle pointer in unnamed param
-                while param_name.startswith("*"):
-                    param_name = param_name[1:]
-                    param_type = "* " + param_type if not param_type.startswith("*") else param_type
-                params.append((param_name, param_type))
+            if rp == "...":
+                params.append(("...", "..."))
+                continue
+            # Function pointer parameters like `int (*cmp)(int, int)` are unsupported
+            if "(" in rp:
+                return None
+
+            # Count array dimensions (e.g. `int a[4]` -> 1 pointer level, `int a[4][4]` -> 2)
+            array_dims = len(re.findall(r'\[[^\]]*\]', rp))
+            rp_no_arr = re.sub(r'\[[^\]]*\]', '', rp).strip()
+
+            # Space around `*` so `int* x` and `int *x` tokenize uniformly
+            rp_spaced = re.sub(r'\*', ' * ', rp_no_arr)
+            tokens = rp_spaced.split()
+            if not tokens:
+                continue
+
+            # If last token is a valid identifier AND not a type keyword/qualifier,
+            # it is the parameter name; otherwise parameter is unnamed.
+            last_tok = tokens[-1]
+            _NON_NAME_TOKS = {
+                "*", "const", "volatile", "restrict", "__restrict", "__restrict__",
+                "register", "void", "char", "short", "int", "long", "signed",
+                "unsigned", "float", "double", "struct", "union", "enum",
+                "bool", "_Bool", "size_t", "ssize_t", "ptrdiff_t",
+            } | {t for t in INTEGER_TYPES if " " not in t}
+
+            if len(tokens) >= 2 and re.match(r'^[a-zA-Z_]\w*$', last_tok) and last_tok not in _NON_NAME_TOKS:
+                param_name = last_tok
+                type_tokens = tokens[:-1]
+            else:
+                # Unnamed parameter (or mangled single-token param like `intn`)
+                if len(tokens) == 1 and not _is_integer_type(tokens[0]):
+                    # Preserve single unknown token so caller rejects as unsupported_type
+                    params.append((tokens[0], tokens[0]))
+                    continue
+                param_name = f"__arg{idx}"
+                type_tokens = tokens
+
+            # Strip trailing pointer qualifiers like `const` / `restrict` after `*`
+            # while preserving the pointer stars
+            param_type = " ".join(type_tokens)
+            for _ in range(array_dims):
+                param_type = (param_type + " *").strip()
+            param_type = re.sub(r'\s+', ' ', param_type).strip()
+            # Normalize `const char * const` -> `const char *`
+            param_type = re.sub(r'\*\s+(?:const|volatile|restrict|__restrict__|__restrict)\b', '*', param_type).strip()
+
+            params.append((param_name, param_type))
 
     return Signature(
         name=func_name,
@@ -583,10 +719,13 @@ def _split_params(params_str: str) -> list[str]:
 
 
 def _extract_called_functions(func_body: str) -> set[str]:
-    """Extract likely function call names from function body."""
-    # Match identifiers followed by opening paren
+    """Extract likely function call names from function body (ignoring comments & strings)."""
+    cleaned = _strip_comments(func_body)
+    # Strip string and char literals so `"foo()"` doesn't match
+    cleaned = re.sub(r'"(?:\\.|[^"\\])*"', '""', cleaned)
+    cleaned = re.sub(r"'(?:\\.|[^'\\])*'", "''", cleaned)
     pattern = re.compile(r'\b([a-zA-Z_]\w*)\s*\(')
-    return set(pattern.findall(func_body))
+    return set(pattern.findall(cleaned))
 
 
 def _extract_io_tests(exebench_record: dict) -> list[dict] | None:
