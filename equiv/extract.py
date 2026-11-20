@@ -137,14 +137,14 @@ def _is_integer_type(typ: str) -> bool:
 
 
 def _is_pointer_to_integer(typ: str) -> tuple[bool, str]:
-    """Check if type is a single pointer to an integer type. Returns (is_ptr_to_int, pointee_type)."""
+    """Check if type is a single pointer to an integer type or void*. Returns (is_valid_ptr, pointee_type)."""
     clean = _clean_type_str(typ)
-    # Reject double pointers (e.g. int **, char * *)
+    # Reject double pointers (e.g. int **, char * *, void **)
     if clean.count("*") != 1:
         return False, ""
     if clean.endswith("*"):
         pointee = clean[:-1].strip()
-        if _is_integer_type(pointee):
+        if _is_integer_type(pointee) or pointee == "void":
             return True, pointee
     return False, ""
 

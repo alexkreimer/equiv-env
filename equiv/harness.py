@@ -236,8 +236,9 @@ def _scalar_type_width(c_type: str) -> str:
 
 
 def _pointee_type(ptr_type: str) -> str:
-    """Extract the clean pointee type from a pointer type."""
-    return _clean_type_str(ptr_type.replace("*", ""))
+    """Extract the clean buffer element type for a pointer (`void *` -> `unsigned char`)."""
+    pt = _clean_type_str(ptr_type.replace("*", ""))
+    return "unsigned char" if pt == "void" else pt
 
 
 def _filter_deps(deps: str) -> str:
@@ -543,7 +544,7 @@ def _emit_return_assert(sig: Signature, pointer_params: list[tuple[str, str]], b
             c_buf = f"{name}{buf_suffix_c}"
             lines.append("#ifdef __CPROVER__")
             lines.append(f"  }} else if (__CPROVER_same_object(__r_o, {o_buf})) {{")
-            lines.append(f"    assert(__CPROVER_same_object(__r_c, {c_buf}) && (__r_o - {o_buf}) == (__r_c - {c_buf}));")
+            lines.append(f"    assert(__CPROVER_same_object(__r_c, {c_buf}) && ((const unsigned char *)__r_o - (const unsigned char *){o_buf}) == ((const unsigned char *)__r_c - (const unsigned char *){c_buf}));")
             lines.append("#endif")
         lines.append("  } else {")
         lines.append("    assert(__r_o == __r_c);")
@@ -889,7 +890,7 @@ def generate_overlap_harness(task: Task, candidate_src: str,
             parts.append("    assert(__r_c == NULL);")
             parts.append("#ifdef __CPROVER__")
             parts.append("  } else if (__CPROVER_same_object(__r_o, shared_o)) {")
-            parts.append("    assert(__CPROVER_same_object(__r_c, shared_c) && (__r_o - shared_o) == (__r_c - shared_c));")
+            parts.append("    assert(__CPROVER_same_object(__r_c, shared_c) && ((const unsigned char *)__r_o - (const unsigned char *)shared_o) == ((const unsigned char *)__r_c - (const unsigned char *)shared_c));")
             parts.append("#endif")
             parts.append("  } else {")
             parts.append("    assert(__r_o == __r_c);")

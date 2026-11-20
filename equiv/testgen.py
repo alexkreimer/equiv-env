@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .extract import Task
-from .harness import generate_harness, NONDET_DECLS, HEADER
+from .harness import generate_harness, NONDET_DECLS, HEADER, _pointee_type
 
 
 @dataclass
@@ -133,7 +133,7 @@ def _generate_random_input(
     inp = {}
     for name, c_type in sig.params:
         if c_type.strip().endswith("*"):
-            pointee = c_type.rstrip("*").replace("const ", "").strip()
+            pointee = _pointee_type(c_type)
             if "char" in pointee and pointer_rules.get(name) == "string":
                 length = random.randint(0, maxn - 1)
                 arr = [random.randint(32, 126) for _ in range(length)] + [0]
@@ -214,7 +214,7 @@ def _generate_edge_inputs(
     # Empty and full buffers for pointer params
     for name, c_type in sig.params:
         if c_type.strip().endswith("*"):
-            pointee = c_type.rstrip("*").replace("const ", "").strip()
+            pointee = _pointee_type(c_type)
             # Empty buffer (all zeros)
             inp = {}
             for n2, t2 in sig.params:
@@ -325,7 +325,7 @@ int main(void) {{
         for name, c_type in sig.params:
             val = test_input.get(name, 0)
             if isinstance(val, list):
-                pointee = c_type.rstrip("*").replace("const ", "").strip()
+                pointee = _pointee_type(c_type)
                 parts.append(f"    {pointee} {name}_o[MAXN];")
                 parts.append(f"    {pointee} {name}_c[MAXN];")
                 for j, v in enumerate(val):
