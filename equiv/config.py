@@ -30,7 +30,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "memory_limit_gb": 8,
     },
     "dataset": {
-        "allowed_libc": ["memset", "memcpy", "strlen"],
+        "allowed_libc": [
+            "memset", "memcpy", "memmove",
+            "strlen", "strcmp", "strncmp", "strcpy", "strchr",
+            "abs", "labs", "llabs",
+        ],
         "excluded_path_patterns": [
             "gcc/testsuite",
             "llvm/test",

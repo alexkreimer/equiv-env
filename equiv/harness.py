@@ -53,6 +53,8 @@ _Bool nondet_bool(void) { return 0; }
 """
 
 HEADER = """
+#undef _FORTIFY_SOURCE
+#define _FORTIFY_SOURCE 0
 #include <assert.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -258,8 +260,10 @@ def _filter_deps(deps: str) -> str:
     # Function prototypes already declared by <string.h> / <stdlib.h>
     REDEFINED_FUNCS = {
         "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat", "strncat",
+        "strchr", "strrchr",
         "memcmp", "memcpy", "memmove", "memset", "memchr",
         "malloc", "free", "calloc", "realloc",
+        "abs", "labs", "llabs",
     }
 
     import re as _re
