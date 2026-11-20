@@ -305,6 +305,28 @@ def _count_loops(func_body: str) -> int:
     return loops
 
 
+def has_input_dependent_loop(func_body: str, signature: Signature) -> bool:
+    """Heuristic: True if at least one loop condition depends on an input parameter."""
+    stripped = _strip_comments(func_body)
+    param_names = {name for name, _ in signature.params if name}
+    if not param_names:
+        return False
+
+    # Check for(init; cond; step) headers and while(cond) headers
+    for m in re.finditer(r'\bfor\s*\(([^;]*);([^;]*);([^)]*)\)', stripped):
+        cond = m.group(2)
+        if any(re.search(rf'\b{re.escape(p)}\b', cond) for p in param_names):
+            return True
+    for m in re.finditer(r'\bwhile\s*\(([^)]*)\)', stripped):
+        cond = m.group(1)
+        if any(re.search(rf'\b{re.escape(p)}\b', cond) for p in param_names):
+            return True
+        # Also catch pointer copies like `char *p = s; while (*p)`
+        if "*" in cond:
+            return True
+    return False
+
+
 def _count_loc(func_body: str) -> int:
     """Count lines of code (non-blank, non-comment-only)."""
     stripped = _strip_comments(func_body)

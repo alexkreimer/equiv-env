@@ -13,6 +13,7 @@ Usage:
     python scripts/build_dataset.py --data-dir data/ --output data/tasks.jsonl
 """
 
+import hashlib
 import re
 import sys
 import os
@@ -26,7 +27,12 @@ from dataclasses import asdict
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from equiv.config import load_config, config_hash
-from equiv.extract import extract_from_exebench, Task
+from equiv.extract import (
+    extract_from_exebench,
+    Task,
+    _normalize_whitespace,
+    has_input_dependent_loop,
+)
 from equiv.harness import generate_self_harness
 from equiv.verify import check_original_ub, _run_cbmc_raw
 from equiv.mutate import mutate
@@ -37,10 +43,17 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 def find_zst_files(data_dir: str) -> list[str]:
     results = []
     for root, dirs, files in os.walk(data_dir):
-        for f in files:
+        dirs.sort()
+        for f in sorted(files):
             if f.endswith(".jsonl.zst"):
                 results.append(os.path.join(root, f))
     return results
+
+
+def _func_dedup_hash(func_src: str) -> str:
+    """Compute a normalized sha256 hash of a C function for deduplication."""
+    norm = _normalize_whitespace(func_src)
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 
 def _is_unwind_only_failure(stdout: str, stderr: str) -> bool:
@@ -146,6 +159,8 @@ def build_dataset(
     output_test: str = "data/tasks_test.jsonl",
     output_rejected: str = "data/rejected.jsonl",
     max_functions: int | None = None,
+    max_train: int | None = None,
+    max_test: int | None = None,
     config_path: str | None = None,
 ):
     """Run the full dataset build pipeline."""
@@ -160,6 +175,7 @@ def build_dataset(
     allowed_libc = set(ds_cfg["allowed_libc"])
     max_per_file = ds_cfg.get("max_per_file")
     max_per_repo = ds_cfg.get("max_per_repo")
+    deduplicate = bool(ds_cfg.get("deduplicate", True))
 
     if data_dir is None:
         data_dir = DATA_DIR
@@ -169,13 +185,16 @@ def build_dataset(
         print("No .jsonl.zst files found.")
         return
 
-    # Determine split from path
+    # Determine split from full path (dir or filename)
     def get_split(path: str) -> str:
-        basename = os.path.basename(path)
-        if "test" in basename.lower():
+        low = path.lower()
+        if "test_real" in low or "real_test" in low or "test_synth" in low or "synth_test" in low:
             return "test"
-        elif "valid" in basename.lower():
+        if "valid_real" in low or "real_valid" in low:
             return "test"  # add valid to test pool per Task C
+        basename = os.path.basename(low)
+        if "test" in basename or "valid" in basename:
+            return "test"
         return "train"
 
     def _source_keys(task_id: str) -> tuple[str, str]:
@@ -186,9 +205,16 @@ def build_dataset(
         repo = "/".join(segs[:2]) if len(segs) >= 2 else file_path
         return file_path, repo
 
+    # Process train files first so deduplication drops any test leak against train
+    train_files = [p for p in zst_files if get_split(p) == "train"]
+    test_files = [p for p in zst_files if get_split(p) == "test"]
+    ordered_files = train_files + test_files
+
     funnel = Counter()
     accepted_per_file = Counter()
     accepted_per_repo = Counter()
+    seen_train_hashes: set[str] = set()
+    seen_test_hashes: set[str] = set()
     accepted_train = []
     accepted_test = []
     rejected = []
@@ -197,9 +223,17 @@ def build_dataset(
     print(f"Config hash: {config_hash(cfg)}")
 
     total = 0
+    seen_per_split = Counter()
     initial_unwind = min(unwind_candidates)
-    for zst_path in zst_files:
+
+    for zst_path in ordered_files:
         split = get_split(zst_path)
+        split_limit = max_train if split == "train" else max_test
+        if split_limit is not None and seen_per_split[split] >= split_limit:
+            continue
+        if max_functions and max_train is None and max_test is None and total >= max_functions:
+            break
+
         for result in extract_from_exebench(
             zst_path,
             split,
@@ -207,11 +241,19 @@ def build_dataset(
             allowed_libc=allowed_libc,
         ):
             total += 1
+            seen_per_split[split] += 1
+
+            def _hit_limit() -> bool:
+                if split_limit is not None and seen_per_split[split] >= split_limit:
+                    return True
+                if max_functions and max_train is None and max_test is None and total >= max_functions:
+                    return True
+                return False
 
             if not result.eligible:
                 funnel[result.reason_code] += 1
                 rejected.append({"task_id": "?", "reason_code": result.reason_code, "split": split})
-                if max_functions and total >= max_functions:
+                if _hit_limit():
                     break
                 continue
 
@@ -220,14 +262,38 @@ def build_dataset(
             task.unwind = initial_unwind
             file_key, repo_key = _source_keys(task.task_id)
 
+            # Deduplication (within split, and test vs train to prevent leakage)
+            if deduplicate:
+                fhash = _func_dedup_hash(task.func_src)
+                if split == "train":
+                    if fhash in seen_train_hashes:
+                        funnel["duplicate"] += 1
+                        rejected.append({"task_id": task.task_id, "reason_code": "duplicate", "split": split})
+                        if _hit_limit():
+                            break
+                        continue
+                else:
+                    if fhash in seen_train_hashes or fhash in seen_test_hashes:
+                        funnel["duplicate"] += 1
+                        rejected.append({"task_id": task.task_id, "reason_code": "duplicate", "split": split})
+                        if _hit_limit():
+                            break
+                        continue
+            else:
+                fhash = None
+
             if max_per_file and accepted_per_file[file_key] >= max_per_file:
                 funnel["cap_exceeded_file"] += 1
                 rejected.append({"task_id": task.task_id, "reason_code": "cap_exceeded_file", "split": split})
+                if _hit_limit():
+                    break
                 continue
 
             if max_per_repo and accepted_per_repo[repo_key] >= max_per_repo:
                 funnel["cap_exceeded_repo"] += 1
                 rejected.append({"task_id": task.task_id, "reason_code": "cap_exceeded_repo", "split": split})
+                if _hit_limit():
+                    break
                 continue
 
             funnel["eligible"] += 1
@@ -236,6 +302,8 @@ def build_dataset(
             if not compile_check(task):
                 funnel["compile_fail"] += 1
                 rejected.append({"task_id": task.task_id, "reason_code": "compile_fail", "split": split})
+                if _hit_limit():
+                    break
                 continue
 
             funnel["compile_pass"] += 1
@@ -247,6 +315,8 @@ def build_dataset(
             if not ub_free:
                 funnel["ub_in_original"] += 1
                 rejected.append({"task_id": task.task_id, "reason_code": "ub_in_original", "split": split})
+                if _hit_limit():
+                    break
                 continue
 
             if ranges:
@@ -264,6 +334,8 @@ def build_dataset(
             if not passed:
                 funnel["self_equiv_fail"] += 1
                 rejected.append({"task_id": task.task_id, "reason_code": "self_equiv_fail", "split": split})
+                if _hit_limit():
+                    break
                 continue
 
             # If unwind search succeeded at a deeper bound, verify UB holds at full depth too
@@ -274,6 +346,8 @@ def build_dataset(
                 if not ub_free_deep:
                     funnel["ub_in_original"] += 1
                     rejected.append({"task_id": task.task_id, "reason_code": "ub_in_original", "split": split})
+                    if _hit_limit():
+                        break
                     continue
                 if ranges_deep and not task.input_ranges:
                     task.input_ranges = ranges_deep
@@ -281,6 +355,11 @@ def build_dataset(
             funnel["self_equiv_pass"] += 1
             accepted_per_file[file_key] += 1
             accepted_per_repo[repo_key] += 1
+            if deduplicate and fhash is not None:
+                if split == "train":
+                    seen_train_hashes.add(fhash)
+                else:
+                    seen_test_hashes.add(fhash)
 
             # Accept
             if split == "test":
@@ -288,11 +367,8 @@ def build_dataset(
             else:
                 accepted_train.append(task)
 
-            if max_functions and total >= max_functions:
+            if _hit_limit():
                 break
-
-        if max_functions and total >= max_functions:
-            break
 
     # Write outputs
     def task_to_dict(t: Task) -> dict:
@@ -302,9 +378,12 @@ def build_dataset(
             "return_type": t.signature.return_type,
             "params": t.signature.params,
         }
+        d["has_input_dependent_loop"] = has_input_dependent_loop(t.func_src, t.signature)
         return d
 
-    os.makedirs(os.path.dirname(output_train), exist_ok=True)
+    os.makedirs(os.path.dirname(output_train) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(output_test) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(output_rejected) or ".", exist_ok=True)
 
     with open(output_train, "w") as f:
         for t in accepted_train:
@@ -319,7 +398,7 @@ def build_dataset(
             f.write(json.dumps(r) + "\n")
 
     # Report
-    print(f"Total processed: {total}")
+    print(f"Total processed: {total} (train={seen_per_split['train']}, test={seen_per_split['test']})")
     print(f"\nFunnel:")
     for stage, count in funnel.most_common():
         print(f"  {stage}: {count}")
@@ -331,7 +410,17 @@ def build_dataset(
         print(f"  p90: {sorted(self_check_times)[int(0.9 * len(self_check_times))]:.2f}")
         print(f"  max: {max(self_check_times):.2f}")
 
-    print(f"\nAccepted: {len(accepted_train)} train, {len(accepted_test)} test")
+    all_accepted = accepted_train + accepted_test
+    n_with_loops = sum(1 for t in all_accepted if t.n_loops > 0)
+    n_input_dep_loops = sum(1 for t in all_accepted if has_input_dependent_loop(t.func_src, t.signature))
+    n_paired = sum(1 for t in all_accepted if "paired" in (t.pointer_rules or {}).values())
+    n_unwind_gt10 = sum(1 for t in all_accepted if t.unwind > initial_unwind)
+    print(f"\nAccepted: {len(accepted_train)} train, {len(accepted_test)} test (total {len(all_accepted)})")
+    if all_accepted:
+        print(f"  with loops: {n_with_loops} ({100*n_with_loops/len(all_accepted):.1f}%)")
+        print(f"  input-dependent loops: {n_input_dep_loops} ({100*n_input_dep_loops/len(all_accepted):.1f}%)")
+        print(f"  paired (ptr, len): {n_paired} ({100*n_paired/len(all_accepted):.1f}%)")
+        print(f"  unwind > {initial_unwind}: {n_unwind_gt10}")
     print(f"Rejected: {len(rejected)}")
 
 
@@ -343,6 +432,8 @@ if __name__ == "__main__":
     parser.add_argument("--output-test", type=str, default="data/tasks_test.jsonl")
     parser.add_argument("--output-rejected", type=str, default="data/rejected.jsonl")
     parser.add_argument("--max-functions", type=int, default=None)
+    parser.add_argument("--max-train", type=int, default=None)
+    parser.add_argument("--max-test", type=int, default=None)
     parser.add_argument("--config", type=str, default=None, help="Path to config.yaml")
     args = parser.parse_args()
 
@@ -352,5 +443,7 @@ if __name__ == "__main__":
         output_test=args.output_test,
         output_rejected=args.output_rejected,
         max_functions=args.max_functions,
+        max_train=args.max_train,
+        max_test=args.max_test,
         config_path=args.config,
     )
