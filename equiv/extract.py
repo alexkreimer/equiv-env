@@ -223,8 +223,11 @@ def _detect_forbidden_constructs(func_body: str) -> str | None:
     return None
 
 
-LENGTH_PARAM_NAMES = {"n", "len", "length", "size", "count", "num", "sz", "cnt"}
-LENGTH_PARAM_SUFFIXES = ("_len", "_size", "_n", "_count", "_num", "_sz")
+LENGTH_PARAM_NAMES = {
+    "n", "len", "length", "size", "count", "num", "sz", "cnt",
+    "width", "height", "rows", "cols", "nelems", "nb",
+}
+LENGTH_PARAM_SUFFIXES = ("_len", "_size", "_n", "_count", "_num", "_sz", "_width", "_height")
 LENGTH_PARAM_PREFIXES = ("len_", "num_", "n_")
 
 

@@ -149,10 +149,10 @@ def _generate_random_input(
                 else:
                     arr = _random_scalar_array(pointee, maxn)
             inp[name] = arr
-        elif name in paired_lengths:
-            inp[name] = random.randint(0, maxn)
         elif name in ranges and isinstance(ranges[name], (list, tuple)) and len(ranges[name]) == 2:
             inp[name] = random.randint(int(ranges[name][0]), int(ranges[name][1]))
+        elif name in paired_lengths:
+            inp[name] = random.randint(0, maxn)
         elif narrowed:
             tmin, tmax, _ = _type_bounds(c_type)
             inp[name] = random.randint(max(-32768, tmin), min(32767, tmax))
@@ -174,6 +174,8 @@ def _generate_edge_inputs(
     inputs = []
 
     def _default_scalar(n2: str, t2: str) -> int:
+        if n2 in ranges and isinstance(ranges[n2], (list, tuple)) and len(ranges[n2]) == 2:
+            return int(ranges[n2][0])
         if n2 in paired_lengths:
             return min(1, maxn)
         return 0
@@ -186,15 +188,17 @@ def _generate_edge_inputs(
     # Collect edge scalars per type
     for name, c_type in sig.params:
         if not c_type.strip().endswith("*"):
-            if name in paired_lengths:
+            if name in ranges and isinstance(ranges[name], (list, tuple)) and len(ranges[name]) == 2:
+                lo, hi = int(ranges[name][0]), int(ranges[name][1])
+                base_type = c_type.replace("const ", "").strip()
+                raw_edges = EDGE_VALUES.get(base_type, [0, 1, -1])
+                edges = sorted(set([v for v in raw_edges if lo <= v <= hi] + [lo, hi]))
+            elif name in paired_lengths:
                 edges = sorted({0, 1, maxn // 2, max(0, maxn - 1), maxn})
             else:
                 base_type = c_type.replace("const ", "").strip()
                 raw_edges = EDGE_VALUES.get(base_type, [0, 1, -1])
-                if name in ranges and isinstance(ranges[name], (list, tuple)) and len(ranges[name]) == 2:
-                    lo, hi = int(ranges[name][0]), int(ranges[name][1])
-                    edges = [v for v in raw_edges if lo <= v <= hi] + [lo, hi]
-                elif narrowed:
+                if narrowed:
                     tmin, tmax, _ = _type_bounds(c_type)
                     lo, hi = max(-32768, tmin), min(32767, tmax)
                     edges = [v for v in raw_edges if lo <= v <= hi] + [lo, hi]

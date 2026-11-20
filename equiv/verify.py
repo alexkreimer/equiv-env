@@ -463,13 +463,34 @@ def check_original_ub(
         return True, None
 
     if _has_safety_failures(result.stdout):
-        # Retry once with narrowed ranges
+        # Stage 1: retry with narrowed ranges [-2^15, 2^15 - 1]
         result_narrow = _run_ub(use_narrow=True)
-        if result_narrow is None or _is_parse_error(result_narrow):
-            return False, None
-        if _has_safety_failures(result_narrow.stdout):
+        if result_narrow is not None and not _is_parse_error(result_narrow):
+            if not _has_safety_failures(result_narrow.stdout):
+                return True, _narrow_ranges(task)
+
+        # Stage 2: retry with positive small scalar ranges [1, 128], paired lengths
+        # [1, MAXN - 1], and buffer elements [-128, 128]
+        from dataclasses import replace as _dc_replace
+        stage2_ranges = _narrow_ranges_stage2(task, maxn=maxn)
+        task_stage2 = _dc_replace(task, input_ranges=stage2_ranges)
+        harness_s2 = generate_ub_harness(task_stage2, maxn=maxn, unwind=unwind)
+        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+            f.write(harness_s2.harness_src)
+            s2_path = f.name
+        try:
+            res_s2 = _run_cbmc_raw(s2_path, unwind, timeout_s, extra_flags=None)
+        except subprocess.TimeoutExpired:
+            res_s2 = None
+        finally:
+            try:
+                os.unlink(s2_path)
+            except OSError:
+                pass
+
+        if res_s2 is None or _is_parse_error(res_s2) or _has_safety_failures(res_s2.stdout):
             return False, None  # ub_in_original
-        return True, _narrow_ranges(task)
+        return True, stage2_ranges
 
     # Only unwinding assertion failed (no safety UB detected at this unwind);
     # caller's unwind search will resolve the unwind bound and re-check if needed.
@@ -518,7 +539,7 @@ def _has_safety_failures(stdout: str) -> bool:
 
 
 def _narrow_ranges(task: Task) -> dict:
-    """Build type-safe narrowed input ranges (excluding paired length params)."""
+    """Build Stage 1 type-safe narrowed input ranges (excluding paired length params)."""
     from .extract import get_paired_length_params
     from .harness import _type_bounds
 
@@ -531,4 +552,23 @@ def _narrow_ranges(task: Task) -> dict:
         lo = max(-32768, tmin)
         hi = min(32767, tmax)
         ranges[name] = [lo, hi]
+    return ranges
+
+
+def _narrow_ranges_stage2(task: Task, maxn: int = 8) -> dict:
+    """Build Stage 2 narrowed ranges: non-zero positive scalars [1, 128],
+    paired lengths [1, maxn - 1], and buffer elements [-128, 128]."""
+    from .extract import get_paired_length_params
+    from .harness import _type_bounds
+
+    paired_lengths = get_paired_length_params(task.signature, task.pointer_rules)
+    ranges: dict = {"_narrowed": True, "_buf_range": [-128, 128]}
+    for name, c_type in task.signature.params:
+        if c_type.strip().endswith("*"):
+            continue
+        if name in paired_lengths:
+            ranges[name] = [1, max(1, maxn - 1)]
+        else:
+            tmin, tmax, _ = _type_bounds(c_type)
+            ranges[name] = [max(1, tmin), min(128, tmax)]
     return ranges
