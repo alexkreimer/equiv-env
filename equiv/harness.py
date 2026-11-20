@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .extract import Task, Signature
+from .extract import Task, Signature, get_paired_length_params, _clean_type_str
 
 
 # ---- CBMC primitive declarations ----
@@ -66,9 +66,9 @@ HEADER = """
 
 # ---- Type-to-nondet mapping ----
 
-def _nondet_for_type(c_type: str) -> str:
+def _nondet_for_type(c_type: str) -> str | None:
     """Map a C type to the appropriate nondet_* function."""
-    clean = c_type.replace("const ", "").replace("volatile ", "").replace("restrict ", "").strip()
+    clean = _clean_type_str(c_type)
 
     # Handle pointers — for nondet, we don't generate symbolic pointers directly;
     # instead we generate buffers in the harness
@@ -77,17 +77,33 @@ def _nondet_for_type(c_type: str) -> str:
 
     mapping = {
         "int": "nondet_int()",
+        "signed": "nondet_int()",
+        "signed int": "nondet_int()",
+        "unsigned": "nondet_uint()",
         "unsigned int": "nondet_uint()",
         "char": "nondet_char()",
+        "signed char": "nondet_char()",
         "unsigned char": "nondet_uchar()",
         "short": "nondet_short()",
+        "short int": "nondet_short()",
+        "signed short": "nondet_short()",
+        "signed short int": "nondet_short()",
         "unsigned short": "nondet_ushort()",
+        "unsigned short int": "nondet_ushort()",
         "long": "nondet_long()",
+        "long int": "nondet_long()",
+        "signed long": "nondet_long()",
+        "signed long int": "nondet_long()",
         "unsigned long": "nondet_ulong()",
+        "unsigned long int": "nondet_ulong()",
         "long long": "nondet_llong()",
+        "long long int": "nondet_llong()",
+        "signed long long": "nondet_llong()",
+        "signed long long int": "nondet_llong()",
         "unsigned long long": "nondet_ullong()",
+        "unsigned long long int": "nondet_ullong()",
         "size_t": "nondet_size_t()",
-        "ssize_t": "nondet_long()",  # ssize_t is long on most platforms
+        "ssize_t": "nondet_long()",  # ssize_t is long on x86-64 LP64
         "ptrdiff_t": "nondet_long()",
         "bool": "nondet_bool()",
         "_Bool": "nondet_bool()",
@@ -104,18 +120,18 @@ def _nondet_for_type(c_type: str) -> str:
         "uintptr_t": "nondet_ulong()",
         "intmax_t": "nondet_llong()",
         "uintmax_t": "nondet_ullong()",
-        "int_fast8_t": "nondet_int()",
-        "uint_fast8_t": "nondet_uint()",
-        "int_fast16_t": "nondet_int()",
-        "uint_fast16_t": "nondet_uint()",
+        "int_fast8_t": "(int_fast8_t)nondet_char()",
+        "uint_fast8_t": "(uint_fast8_t)nondet_uchar()",
+        "int_fast16_t": "(int_fast16_t)nondet_short()",
+        "uint_fast16_t": "(uint_fast16_t)nondet_ushort()",
         "int_fast32_t": "nondet_int()",
         "uint_fast32_t": "nondet_uint()",
         "int_fast64_t": "nondet_llong()",
         "uint_fast64_t": "nondet_ullong()",
-        "int_least8_t": "nondet_int()",
-        "uint_least8_t": "nondet_uint()",
-        "int_least16_t": "nondet_int()",
-        "uint_least16_t": "nondet_uint()",
+        "int_least8_t": "(int_least8_t)nondet_char()",
+        "uint_least8_t": "(uint_least8_t)nondet_uchar()",
+        "int_least16_t": "(int_least16_t)nondet_short()",
+        "uint_least16_t": "(uint_least16_t)nondet_ushort()",
         "int_least32_t": "nondet_int()",
         "uint_least32_t": "nondet_uint()",
         "int_least64_t": "nondet_llong()",
@@ -124,18 +140,88 @@ def _nondet_for_type(c_type: str) -> str:
     return mapping.get(clean, None)
 
 
-def _scalar_type_width(c_type: str) -> str:
-    """Get the underlying width category for a scalar type (for buffer indexing)."""
-    clean = c_type.replace("const ", "").replace("volatile ", "").replace("restrict ", "").strip()
+def _type_bounds(c_type: str) -> tuple[int, int, bool]:
+    """Return (min_val, max_val, is_unsigned) for an x86-64 LP64 integer C type."""
+    clean = _clean_type_str(c_type)
     if clean.endswith("*"):
         clean = clean[:-1].strip()
 
-    small_types = {"char", "unsigned char", "int8_t", "uint8_t", "_Bool", "bool"}
-    medium_types = {"short", "unsigned short", "int16_t", "uint16_t"}
-    large_types = {"int", "unsigned int", "int32_t", "uint32_t", "int_fast32_t", "uint_fast32_t"}
-    xl_types = {"long", "unsigned long", "long long", "unsigned long long",
-                "int64_t", "uint64_t", "size_t", "ssize_t", "ptrdiff_t",
-                "intptr_t", "uintptr_t", "intmax_t", "uintmax_t"}
+    if clean in ("bool", "_Bool"):
+        return (0, 1, True)
+    if clean in ("char", "signed char", "int8_t", "int_least8_t", "int_fast8_t"):
+        return (-128, 127, False)
+    if clean in ("unsigned char", "uint8_t", "uint_least8_t", "uint_fast8_t"):
+        return (0, 255, True)
+    if clean in ("short", "short int", "signed short", "signed short int", "int16_t", "int_least16_t"):
+        return (-32768, 32767, False)
+    if clean in ("unsigned short", "unsigned short int", "uint16_t", "uint_least16_t"):
+        return (0, 65535, True)
+    if clean in ("int", "signed", "signed int", "int32_t", "int_least32_t", "int_fast16_t", "int_fast32_t"):
+        return (-2147483648, 2147483647, False)
+    if clean in ("unsigned", "unsigned int", "uint32_t", "uint_least32_t", "uint_fast16_t", "uint_fast32_t"):
+        return (0, 4294967295, True)
+    if clean in (
+        "long", "long int", "signed long", "signed long int",
+        "long long", "long long int", "signed long long", "signed long long int",
+        "int64_t", "int_least64_t", "int_fast64_t", "ssize_t", "ptrdiff_t",
+        "intptr_t", "intmax_t",
+    ):
+        return (-(1 << 63), (1 << 63) - 1, False)
+    if clean in (
+        "unsigned long", "unsigned long int",
+        "unsigned long long", "unsigned long long int",
+        "uint64_t", "uint_least64_t", "uint_fast64_t",
+        "size_t", "uintptr_t", "uintmax_t",
+    ):
+        return (0, (1 << 64) - 1, True)
+    # Conservative signed 32-bit fallback
+    return (-2147483648, 2147483647, False)
+
+
+def _emit_range_assume(var_expr: str, c_type: str, lo: int, hi: int) -> str | None:
+    """Emit a C-type-safe __CPROVER_assume bounding var_expr to [lo, hi].
+
+    Clamps [lo, hi] to the C type's representable range so we NEVER emit
+    unsatisfiable unsigned-vs-negative comparisons like `(unsigned)x >= -32768`.
+    Returns None if the clamped range already covers the entire type.
+    """
+    tmin, tmax, is_unsigned = _type_bounds(c_type)
+    clo = max(lo, tmin)
+    chi = min(hi, tmax)
+    if clo > chi:
+        return None
+    if clo <= tmin and chi >= tmax:
+        return None
+    if is_unsigned:
+        if clo <= 0:
+            return f"__CPROVER_assume({var_expr} <= {chi}ULL);"
+        return f"__CPROVER_assume({var_expr} >= {clo}ULL && {var_expr} <= {chi}ULL);"
+    return f"__CPROVER_assume({var_expr} >= {clo} && {var_expr} <= {chi});"
+
+
+def _scalar_type_width(c_type: str) -> str:
+    """Get the underlying width category for a scalar type (for buffer indexing)."""
+    clean = _clean_type_str(c_type)
+    if clean.endswith("*"):
+        clean = clean[:-1].strip()
+
+    small_types = {"char", "signed char", "unsigned char", "int8_t", "uint8_t", "_Bool", "bool"}
+    medium_types = {
+        "short", "short int", "signed short", "signed short int",
+        "unsigned short", "unsigned short int", "int16_t", "uint16_t",
+    }
+    large_types = {
+        "int", "signed", "signed int", "unsigned", "unsigned int",
+        "int32_t", "uint32_t", "int_fast32_t", "uint_fast32_t",
+    }
+    xl_types = {
+        "long", "long int", "signed long", "signed long int",
+        "unsigned long", "unsigned long int",
+        "long long", "long long int", "signed long long", "signed long long int",
+        "unsigned long long", "unsigned long long int",
+        "int64_t", "uint64_t", "size_t", "ssize_t", "ptrdiff_t",
+        "intptr_t", "uintptr_t", "intmax_t", "uintmax_t",
+    }
 
     if clean in small_types:
         return "char"
@@ -150,8 +236,8 @@ def _scalar_type_width(c_type: str) -> str:
 
 
 def _pointee_type(ptr_type: str) -> str:
-    """Extract the pointee type from a pointer type."""
-    return ptr_type.replace("const ", "").replace("volatile ", "").replace("restrict ", "").replace("*", "").strip()
+    """Extract the clean pointee type from a pointer type."""
+    return _clean_type_str(ptr_type.replace("*", ""))
 
 
 def _filter_deps(deps: str) -> str:
@@ -292,103 +378,162 @@ def generate_harness(task: Task, candidate_src: str, maxn: int = 8, unwind: int 
     )
 
 
-def _generate_harness_body(task: Task, maxn: int) -> str:
-    """Generate the body of the harness function."""
-    lines = []
+def _emit_scalar_inits(
+    task: Task,
+    maxn: int,
+    *,
+    use_narrow_ranges: bool = False,
+) -> list[str]:
+    """Emit symbolic scalar declarations and __CPROVER_assume bounds.
+
+    Shared by main equivalence harness, overlap harness, and original-only UB
+    harness so all three see the exact same input domain.
+    """
+    lines: list[str] = []
     sig = task.signature
-    pointer_rules = task.pointer_rules
+    scalar_params = [(n, t) for n, t in sig.params if not t.strip().endswith("*")]
+    if not scalar_params:
+        return lines
 
-    scalar_params = []
-    pointer_params = []
+    paired_lengths = get_paired_length_params(sig, task.pointer_rules)
+    input_ranges = task.input_ranges or {}
+    narrowed = use_narrow_ranges or bool(input_ranges.get("_narrowed"))
 
-    for name, c_type in sig.params:
-        if c_type.endswith("*"):
-            pointer_params.append((name, c_type))
-        else:
-            scalar_params.append((name, c_type))
-
-    # Step 1: Symbolic scalars — generate nondet values with __CPROVER_assume bounds
-    if scalar_params:
-        lines.append("  /* 1. Symbolic scalar inputs */")
+    lines.append("  /* 1. Symbolic scalar inputs */")
     for name, c_type in scalar_params:
-        nondet_call = _nondet_for_type(c_type)
+        decl_type = _clean_type_str(c_type)
+        nondet_call = _nondet_for_type(decl_type)
         if nondet_call:
-            lines.append(f"  {c_type} {name} = {nondet_call};")
+            lines.append(f"  {decl_type} {name} = {nondet_call};")
         else:
-            # Fallback for unknown types — try to use nondet_int
-            lines.append(f"  {c_type} {name} = ({c_type})nondet_int();")
+            lines.append(f"  {decl_type} {name} = ({decl_type})nondet_int();")
 
-    # Assume bounds for integer scalars to prevent overflow/UB
-    # Use generous but finite bounds
-    if scalar_params:
-        lines.append("")
-        for name, c_type in scalar_params:
-            clean = c_type.replace("const ", "").strip()
-            # Bound large values to prevent overflow UB
-            if clean in ("int", "long", "long long", "int32_t", "int64_t",
-                          "ssize_t", "ptrdiff_t", "intptr_t", "intmax_t"):
-                lines.append(f"  __CPROVER_assume({name} > -1073741824 && {name} < 1073741824);")
+    lines.append("")
+    for name, c_type in scalar_params:
+        decl_type = _clean_type_str(c_type)
+        _, _, is_unsigned = _type_bounds(decl_type)
 
-    # Step 2: Symbolic buffer arrays + identical copies
-    if pointer_params:
-        lines.append("")
+        # Paired length parameters MUST stay within [0, MAXN]
+        if name in paired_lengths:
+            if is_unsigned:
+                lines.append(f"  __CPROVER_assume({name} <= MAXN);")
+            else:
+                lines.append(f"  __CPROVER_assume({name} >= 0 && {name} <= MAXN);")
+            continue
+
+        # Explicit per-parameter range from task.input_ranges
+        if name in input_ranges and isinstance(input_ranges[name], (list, tuple)) and len(input_ranges[name]) == 2:
+            lo, hi = int(input_ranges[name][0]), int(input_ranges[name][1])
+            assume = _emit_range_assume(name, decl_type, lo, hi)
+            if assume:
+                lines.append(f"  {assume}")
+            continue
+
+        # Uniform narrowed range [-2^15, 2^15 - 1] (clamped safely to type bounds)
+        if narrowed:
+            assume = _emit_range_assume(name, decl_type, -32768, 32767)
+            if assume:
+                lines.append(f"  {assume}")
+            continue
+
+        # Default generous finite bound for wide signed scalars (avoids INT_MIN corner UB)
+        if decl_type in (
+            "int", "signed", "signed int",
+            "long", "long int", "signed long", "signed long int",
+            "long long", "long long int", "signed long long", "signed long long int",
+            "int32_t", "int64_t", "ssize_t", "ptrdiff_t", "intptr_t", "intmax_t",
+        ):
+            lines.append(f"  __CPROVER_assume({name} > -1073741824 && {name} < 1073741824);")
+
+    return lines
+
+
+def _emit_buffer_inits(
+    task: Task,
+    maxn: int,
+    *,
+    dual: bool = True,
+    use_narrow_ranges: bool = False,
+) -> list[str]:
+    """Emit symbolic buffer arrays (and optional identical copies for candidate).
+
+    Handles `string` (null terminator at symbolic position < MAXN), `paired`,
+    and `fixed` buffer rules, plus narrowed element bounds when requested.
+    """
+    lines: list[str] = []
+    sig = task.signature
+    pointer_rules = task.pointer_rules or {}
+    pointer_params = [(n, t) for n, t in sig.params if t.strip().endswith("*")]
+    if not pointer_params:
+        return lines
+
+    input_ranges = task.input_ranges or {}
+    narrowed = use_narrow_ranges or bool(input_ranges.get("_narrowed"))
+    buf_range = input_ranges.get("_buf_range", (-32768, 32767))
+
+    lines.append("")
+    if dual:
         lines.append("  /* 2. Symbolic buffers (separate for original and candidate) */")
-
-    # Track buffer declarations for the post-call comparison
-    buffer_vars_orig = []
-    buffer_vars_cand = []
+    else:
+        lines.append("  /* 2. Symbolic buffers */")
 
     for buf_idx, (name, c_type) in enumerate(pointer_params):
         pointee = _pointee_type(c_type)
         rule = pointer_rules.get(name, "fixed")
+        nondet_elem = _nondet_for_type(pointee) or f"({pointee})nondet_int()"
 
         if rule == "string":
-            # String: char array with null terminator at symbolic position
+            # [R1] Every char* without a length param gets a '\0' at symbolic pos < MAXN
             lines.append(f"  {pointee} {name}_o[MAXN];")
-            lines.append(f"  {pointee} {name}_c[MAXN];")
+            if dual:
+                lines.append(f"  {pointee} {name}_c[MAXN];")
             lines.append(f"  for (int __i = 0; __i < MAXN; __i++) {{")
-            lines.append(f"    {name}_o[__i] = nondet_char();")
-            lines.append(f"    {name}_c[__i] = {name}_o[__i];")
+            lines.append(f"    {name}_o[__i] = {nondet_elem};")
+            if dual:
+                lines.append(f"    {name}_c[__i] = {name}_o[__i];")
             lines.append(f"  }}")
-            # Force null termination somewhere, allowing empty string at position 0
             lines.append(f"  int __null_{buf_idx} = nondet_int();")
             lines.append(f"  __CPROVER_assume(__null_{buf_idx} >= 0 && __null_{buf_idx} < MAXN);")
             lines.append(f"  {name}_o[__null_{buf_idx}] = '\\0';")
-            lines.append(f"  {name}_c[__null_{buf_idx}] = '\\0';")
+            if dual:
+                lines.append(f"  {name}_c[__null_{buf_idx}] = '\\0';")
         else:
-            # Fixed or paired: integer-typed buffer
-            width = _scalar_type_width(pointee)
             lines.append(f"  {pointee} {name}_o[MAXN];")
-            lines.append(f"  {pointee} {name}_c[MAXN];")
+            if dual:
+                lines.append(f"  {pointee} {name}_c[MAXN];")
             lines.append(f"  for (int __i = 0; __i < MAXN; __i++) {{")
-            if width == "char":
-                lines.append(f"    {name}_o[__i] = ({pointee})nondet_uchar();")
-            elif width == "short":
-                lines.append(f"    {name}_o[__i] = ({pointee})nondet_ushort();")
-            elif width == "int":
-                lines.append(f"    {name}_o[__i] = ({pointee})nondet_int();")
-            else:
-                lines.append(f"    {name}_o[__i] = ({pointee})nondet_llong();")
-            lines.append(f"    {name}_c[__i] = {name}_o[__i];")
+            lines.append(f"    {name}_o[__i] = {nondet_elem};")
+            if narrowed:
+                assume = _emit_range_assume(f"{name}_o[__i]", pointee, int(buf_range[0]), int(buf_range[1]))
+                if assume:
+                    lines.append(f"    {assume}")
+            if dual:
+                lines.append(f"    {name}_c[__i] = {name}_o[__i];")
             lines.append(f"  }}")
 
-            # For paired pointers, constrain the size parameter
-            if rule == "paired":
-                # Find the paired size parameter and constrain it
-                lines.append(f"  /* {name} is paired with a size parameter */")
+    return lines
 
-        buffer_vars_orig.append(f"{name}_o")
-        buffer_vars_cand.append(f"{name}_c")
+
+def _generate_harness_body(task: Task, maxn: int) -> str:
+    """Generate the body of the equivalence harness function."""
+    lines: list[str] = []
+    sig = task.signature
+    pointer_params = [(n, t) for n, t in sig.params if t.strip().endswith("*")]
+
+    # Step 1: Symbolic scalars + bounds (paired lengths, input_ranges, etc.)
+    lines.extend(_emit_scalar_inits(task, maxn))
+
+    # Step 2: Symbolic buffer arrays + identical copies
+    lines.extend(_emit_buffer_inits(task, maxn, dual=True))
 
     # Step 3: Call both functions
     lines.append("")
     lines.append("  /* 3. Call original and candidate */")
 
-    # Build call argument lists
     orig_args = []
     cand_args = []
     for name, c_type in sig.params:
-        if c_type.endswith("*"):
+        if c_type.strip().endswith("*"):
             orig_args.append(f"{name}_o")
             cand_args.append(f"{name}_c")
         else:
@@ -398,11 +543,12 @@ def _generate_harness_body(task: Task, maxn: int) -> str:
     orig_call = f"orig__{task.func_name}({', '.join(orig_args)});"
     cand_call = f"cand__{task.func_name}({', '.join(cand_args)});"
 
-    ret_is_void = sig.return_type == "void"
+    ret_clean = _clean_type_str(sig.return_type)
+    ret_is_void = ret_clean == "void"
 
     if not ret_is_void:
-        lines.append(f"  {sig.return_type} __r_o = {orig_call}")
-        lines.append(f"  {sig.return_type} __r_c = {cand_call}")
+        lines.append(f"  {ret_clean} __r_o = {orig_call}")
+        lines.append(f"  {ret_clean} __r_c = {cand_call}")
     else:
         lines.append(f"  {orig_call}")
         lines.append(f"  {cand_call}")
@@ -412,15 +558,74 @@ def _generate_harness_body(task: Task, maxn: int) -> str:
     lines.append("  /* 4. Assert equivalence */")
 
     if not ret_is_void:
-        lines.append(f"  assert(__r_o == __r_c);")
+        lines.append("  assert(__r_o == __r_c);")
 
     # Assert buffer equality post-call
-    for buf_idx, (name, _) in enumerate(pointer_params):
+    for name, _ in pointer_params:
         lines.append(f"  for (int __i = 0; __i < MAXN; __i++) {{")
         lines.append(f"    assert({name}_o[__i] == {name}_c[__i]);")
         lines.append(f"  }}")
 
     return "\n".join(lines)
+
+
+def generate_ub_harness(
+    task: Task,
+    maxn: int = 8,
+    unwind: int | None = None,
+    use_narrow_ranges: bool = False,
+) -> HarnessResult:
+    """Generate an original-only UB check harness using the exact same input
+    setup (headers, deps, string terminators, paired length bounds, ranges)
+    as the main equivalence harness."""
+    if unwind is None:
+        unwind = maxn + 2
+
+    parts: list[str] = []
+    parts.append(HEADER)
+
+    if task.deps_src:
+        filtered_deps = _filter_deps(task.deps_src)
+        if filtered_deps:
+            parts.append("/* Type definitions and macros */")
+            parts.append(filtered_deps)
+
+    parts.append(f"#define MAXN {maxn}")
+    parts.append("")
+    parts.append(NONDET_DECLS)
+
+    orig_renamed = _rename_function(task.func_src, task.func_name, f"orig__{task.func_name}")
+    if orig_renamed is None:
+        orig_renamed = task.func_src
+        call_name = task.func_name
+    else:
+        call_name = f"orig__{task.func_name}"
+    parts.append(orig_renamed)
+
+    parts.append("")
+    parts.append("/* Original-only UB check harness */")
+    parts.append("void harness(void) {")
+    parts.extend(_emit_scalar_inits(task, maxn, use_narrow_ranges=use_narrow_ranges))
+    parts.extend(_emit_buffer_inits(task, maxn, dual=False, use_narrow_ranges=use_narrow_ranges))
+
+    sig = task.signature
+    args = [f"{name}_o" if c_type.strip().endswith("*") else name for name, c_type in sig.params]
+    ret_clean = _clean_type_str(sig.return_type)
+    parts.append("")
+    if ret_clean != "void":
+        parts.append(f"  {ret_clean} __r = {call_name}({', '.join(args)});")
+        parts.append("  (void)__r;")
+    else:
+        parts.append(f"  {call_name}({', '.join(args)});")
+    parts.append("}")
+
+    return HarnessResult(
+        harness_src="\n".join(parts),
+        original_func_name=call_name,
+        candidate_func_name=call_name,
+        maxn=maxn,
+        unwind=unwind,
+    )
 
 
 def _rename_function(src: str, old_name: str, new_name: str) -> str | None:
@@ -582,24 +787,29 @@ def generate_overlap_harness(task: Task, candidate_src: str,
     # Harness
     parts.append("void harness(void) {")
 
-    # Scalar params
-    scalar_params = [(name, c_type) for name, c_type in sig.params if not c_type.endswith("*")]
-    for name, c_type in scalar_params:
-        nondet_call = _nondet_for_type(c_type)
-        if nondet_call:
-            parts.append(f"  {c_type} {name} = {nondet_call};")
-        else:
-            parts.append(f"  {c_type} {name} = ({c_type})nondet_int();")
+    # Scalar params (with paired length bounds and input_ranges)
+    parts.extend(_emit_scalar_inits(task, maxn))
 
     # Shared buffer: double the size to accommodate offsets
-    parts.append(f"")
-    parts.append(f"  /* Shared buffer: all pointers alias into one array */")
+    nondet_elem = _nondet_for_type(pointee) or f"({pointee})nondet_int()"
+    input_ranges = task.input_ranges or {}
+    narrowed = bool(input_ranges.get("_narrowed"))
+    buf_range = input_ranges.get("_buf_range", (-32768, 32767))
+    pointer_rules = task.pointer_rules or {}
+    any_string = any(pointer_rules.get(name) == "string" for name, _ in pointer_params)
+
+    parts.append("")
+    parts.append("  /* Shared buffer: all pointers alias into one array */")
     parts.append(f"  {pointee} shared_o[MAXN * 2];")
     parts.append(f"  {pointee} shared_c[MAXN * 2];")
-    parts.append(f"  for (int __i = 0; __i < MAXN * 2; __i++) {{")
-    parts.append(f"    shared_o[__i] = ({pointee})nondet_int();")
-    parts.append(f"    shared_c[__i] = shared_o[__i];")
-    parts.append(f"  }}")
+    parts.append("  for (int __i = 0; __i < MAXN * 2; __i++) {")
+    parts.append(f"    shared_o[__i] = {nondet_elem};")
+    if narrowed and not any_string:
+        assume = _emit_range_assume("shared_o[__i]", pointee, int(buf_range[0]), int(buf_range[1]))
+        if assume:
+            parts.append(f"    {assume}")
+    parts.append("    shared_c[__i] = shared_o[__i];")
+    parts.append("  }")
 
     # Symbolic offsets for each pointer into the shared buffer
     pointer_names = [name for name, _ in pointer_params]
@@ -613,32 +823,39 @@ def generate_overlap_harness(task: Task, candidate_src: str,
             parts.append(f"  {pointee} *{name}_o = shared_o + __off_{idx};")
             parts.append(f"  {pointee} *{name}_c = shared_c + __off_{idx};")
 
+        if pointer_rules.get(name) == "string":
+            parts.append(f"  int __null_{idx} = nondet_int();")
+            parts.append(f"  __CPROVER_assume(__null_{idx} >= 0 && __null_{idx} < MAXN);")
+            parts.append(f"  {name}_o[__null_{idx}] = '\\0';")
+            parts.append(f"  {name}_c[__null_{idx}] = '\\0';")
+
     # Call both
     parts.append("")
     parts.append("  /* Call original and candidate on shared buffers */")
     orig_args = []
     cand_args = []
     for name, c_type in sig.params:
-        if c_type.endswith("*"):
+        if c_type.strip().endswith("*"):
             orig_args.append(f"{name}_o")
             cand_args.append(f"{name}_c")
         else:
             orig_args.append(name)
             cand_args.append(name)
 
-    ret_void = sig.return_type == "void"
+    ret_clean = _clean_type_str(sig.return_type)
+    ret_void = ret_clean == "void"
     if not ret_void:
-        parts.append(f"  {sig.return_type} __r_o = orig__{task.func_name}({', '.join(orig_args)});")
-        parts.append(f"  {sig.return_type} __r_c = cand__{task.func_name}({', '.join(cand_args)});")
-        parts.append(f"  assert(__r_o == __r_c);")
+        parts.append(f"  {ret_clean} __r_o = orig__{task.func_name}({', '.join(orig_args)});")
+        parts.append(f"  {ret_clean} __r_c = cand__{task.func_name}({', '.join(cand_args)});")
+        parts.append("  assert(__r_o == __r_c);")
     else:
         parts.append(f"  orig__{task.func_name}({', '.join(orig_args)});")
         parts.append(f"  cand__{task.func_name}({', '.join(cand_args)});")
 
     # Compare shared buffers
-    parts.append(f"  for (int __i = 0; __i < MAXN * 2; __i++) {{")
-    parts.append(f"    assert(shared_o[__i] == shared_c[__i]);")
-    parts.append(f"  }}")
+    parts.append("  for (int __i = 0; __i < MAXN * 2; __i++) {")
+    parts.append("    assert(shared_o[__i] == shared_c[__i]);")
+    parts.append("  }")
 
     parts.append("}")
 
