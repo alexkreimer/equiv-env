@@ -63,6 +63,17 @@ HEADER = """
    into "typedef int _Bool" which is illegal (C keyword). */
 #include <string.h>
 #include <stdlib.h>
+#include <sys/types.h>
+
+typedef uint8_t __u8;
+typedef uint16_t __u16;
+typedef uint32_t __u32;
+typedef uint64_t __u64;
+typedef int8_t __s8;
+typedef int16_t __s16;
+typedef int32_t __s32;
+typedef int64_t __s64;
+typedef unsigned long int ulong;
 """
 
 
@@ -138,6 +149,33 @@ def _nondet_for_type(c_type: str) -> str | None:
         "uint_least32_t": "nondet_uint()",
         "int_least64_t": "nondet_llong()",
         "uint_least64_t": "nondet_ullong()",
+        # POSIX / BSD / Linux kernel standard integer aliases
+        "u_char": "nondet_uchar()",
+        "u_short": "nondet_ushort()",
+        "ushort": "nondet_ushort()",
+        "u_int": "nondet_uint()",
+        "uint": "nondet_uint()",
+        "u_long": "nondet_ulong()",
+        "ulong": "nondet_ulong()",
+        "u_int8_t": "(u_int8_t)nondet_uchar()",
+        "u_int16_t": "(u_int16_t)nondet_ushort()",
+        "u_int32_t": "nondet_uint()",
+        "u_int64_t": "nondet_ullong()",
+        "__u8": "(__u8)nondet_uchar()",
+        "__u16": "(__u16)nondet_ushort()",
+        "__u32": "nondet_uint()",
+        "__u64": "nondet_ullong()",
+        "__s8": "(__s8)nondet_char()",
+        "__s16": "(__s16)nondet_short()",
+        "__s32": "nondet_int()",
+        "__s64": "nondet_llong()",
+        "off_t": "nondet_long()",
+        "time_t": "nondet_long()",
+        "mode_t": "(mode_t)nondet_uint()",
+        "pid_t": "nondet_int()",
+        "uid_t": "nondet_uint()",
+        "gid_t": "nondet_uint()",
+        "wchar_t": "nondet_int()",
     }
     return mapping.get(clean, None)
 
@@ -150,30 +188,30 @@ def _type_bounds(c_type: str) -> tuple[int, int, bool]:
 
     if clean in ("bool", "_Bool"):
         return (0, 1, True)
-    if clean in ("char", "signed char", "int8_t", "int_least8_t", "int_fast8_t"):
+    if clean in ("char", "signed char", "int8_t", "int_least8_t", "int_fast8_t", "__s8"):
         return (-128, 127, False)
-    if clean in ("unsigned char", "uint8_t", "uint_least8_t", "uint_fast8_t"):
+    if clean in ("unsigned char", "uint8_t", "uint_least8_t", "uint_fast8_t", "u_char", "u_int8_t", "__u8"):
         return (0, 255, True)
-    if clean in ("short", "short int", "signed short", "signed short int", "int16_t", "int_least16_t"):
+    if clean in ("short", "short int", "signed short", "signed short int", "int16_t", "int_least16_t", "__s16"):
         return (-32768, 32767, False)
-    if clean in ("unsigned short", "unsigned short int", "uint16_t", "uint_least16_t"):
+    if clean in ("unsigned short", "unsigned short int", "uint16_t", "uint_least16_t", "u_short", "ushort", "u_int16_t", "__u16"):
         return (0, 65535, True)
-    if clean in ("int", "signed", "signed int", "int32_t", "int_least32_t", "int_fast16_t", "int_fast32_t"):
+    if clean in ("int", "signed", "signed int", "int32_t", "int_least32_t", "int_fast16_t", "int_fast32_t", "__s32", "pid_t", "wchar_t"):
         return (-2147483648, 2147483647, False)
-    if clean in ("unsigned", "unsigned int", "uint32_t", "uint_least32_t", "uint_fast16_t", "uint_fast32_t"):
+    if clean in ("unsigned", "unsigned int", "uint32_t", "uint_least32_t", "uint_fast16_t", "uint_fast32_t", "u_int", "uint", "u_int32_t", "__u32", "mode_t", "uid_t", "gid_t"):
         return (0, 4294967295, True)
     if clean in (
         "long", "long int", "signed long", "signed long int",
         "long long", "long long int", "signed long long", "signed long long int",
         "int64_t", "int_least64_t", "int_fast64_t", "ssize_t", "ptrdiff_t",
-        "intptr_t", "intmax_t",
+        "intptr_t", "intmax_t", "__s64", "off_t", "time_t",
     ):
         return (-(1 << 63), (1 << 63) - 1, False)
     if clean in (
         "unsigned long", "unsigned long int",
         "unsigned long long", "unsigned long long int",
         "uint64_t", "uint_least64_t", "uint_fast64_t",
-        "size_t", "uintptr_t", "uintmax_t",
+        "size_t", "uintptr_t", "uintmax_t", "u_long", "ulong", "u_int64_t", "__u64",
     ):
         return (0, (1 << 64) - 1, True)
     # Conservative signed 32-bit fallback
@@ -255,6 +293,12 @@ def _filter_deps(deps: str) -> str:
         "int_fast32_t", "uint_fast32_t", "int_fast64_t", "uint_fast64_t",
         "int_least8_t", "uint_least8_t", "int_least16_t", "uint_least16_t",
         "int_least32_t", "uint_least32_t", "int_least64_t", "uint_least64_t",
+        "u_char", "u_short", "u_int", "u_long",
+        "ushort", "uint", "ulong",
+        "u_int8_t", "u_int16_t", "u_int32_t", "u_int64_t",
+        "__u8", "__u16", "__u32", "__u64",
+        "__s8", "__s16", "__s32", "__s64",
+        "off_t", "mode_t", "pid_t", "uid_t", "gid_t", "time_t", "wchar_t",
         "NULL",
     }
     # Function prototypes already declared by <string.h> / <stdlib.h>
