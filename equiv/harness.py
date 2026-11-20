@@ -431,20 +431,20 @@ def _emit_scalar_inits(
         decl_type = _clean_type_str(c_type)
         _, _, is_unsigned = _type_bounds(decl_type)
 
-        # Paired length parameters MUST stay within [0, MAXN]
-        if name in paired_lengths:
-            if is_unsigned:
-                lines.append(f"  __CPROVER_assume({name} <= MAXN);")
-            else:
-                lines.append(f"  __CPROVER_assume({name} >= 0 && {name} <= MAXN);")
-            continue
-
-        # Explicit per-parameter range from task.input_ranges
+        # Explicit per-parameter range from task.input_ranges (including Stage 2 paired lengths)
         if name in input_ranges and isinstance(input_ranges[name], (list, tuple)) and len(input_ranges[name]) == 2:
             lo, hi = int(input_ranges[name][0]), int(input_ranges[name][1])
             assume = _emit_range_assume(name, decl_type, lo, hi)
             if assume:
                 lines.append(f"  {assume}")
+            continue
+
+        # Paired length parameters MUST stay within [0, MAXN] by default
+        if name in paired_lengths:
+            if is_unsigned:
+                lines.append(f"  __CPROVER_assume({name} <= MAXN);")
+            else:
+                lines.append(f"  __CPROVER_assume({name} >= 0 && {name} <= MAXN);")
             continue
 
         # Uniform narrowed range [-2^15, 2^15 - 1] (clamped safely to type bounds)
