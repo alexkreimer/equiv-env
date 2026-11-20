@@ -112,6 +112,13 @@ INTEGER_TYPES = {
     "intptr_t", "uintptr_t", "intmax_t", "uintmax_t",
     "size_t", "ssize_t", "ptrdiff_t",
     "bool", "_Bool",
+    # POSIX / BSD / Linux kernel standard integer aliases
+    "u_char", "u_short", "u_int", "u_long",
+    "ushort", "uint", "ulong",
+    "u_int8_t", "u_int16_t", "u_int32_t", "u_int64_t",
+    "__u8", "__u16", "__u32", "__u64",
+    "__s8", "__s16", "__s32", "__s64",
+    "off_t", "mode_t", "pid_t", "uid_t", "gid_t", "time_t", "wchar_t",
 }
 
 FORBIDDEN_TYPES = {
