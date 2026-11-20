@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from .cache import EvalCache
+from .config import config_hash as compute_config_hash, get_config, load_config
 from .extract import Task
 from .verify import verify, VerifyResult, self_verify
 
@@ -49,15 +50,17 @@ class EvalResult:
 # Global cache instance (lazy init)
 _cache: EvalCache | None = None
 _config_hash: str = ""
+_active_config: dict | None = None
 
 
-def init(config: dict | None = None, cache_path: str = "data/eval_cache.db"):
-    """Initialize the reward module with config and cache."""
-    global _cache, _config_hash
-    _cache = EvalCache(cache_path)
-    _config_hash = hashlib.sha256(
-        (str(config) if config else "").encode()
-    ).hexdigest()[:16]
+def init(config: dict | None = None, cache_path: str | None = None):
+    """Initialize the reward module with config (defaults to config.yaml) and cache."""
+    global _cache, _config_hash, _active_config
+    cfg = load_config() if config is None else config
+    _active_config = cfg
+    resolved_cache = cache_path or cfg.get("cache", {}).get("path", "data/eval_cache.db")
+    _cache = EvalCache(resolved_cache)
+    _config_hash = compute_config_hash(cfg)
 
 
 def evaluate(
@@ -170,16 +173,25 @@ def evaluate(
     return result
 
 
-def reward(r: EvalResult, cap: float = 4.0, min_gain: float = 1.05,
-           base: float = 0.0) -> float:
+def reward(
+    r: EvalResult,
+    cap: float | None = None,
+    min_gain: float | None = None,
+    base: float | None = None,
+) -> float:
     """Compute reward from evaluation result.
 
-    [R1] Reward structure:
+    [R1] Reward structure (defaults loaded from config.yaml):
         - Not proven: 0.0
         - near_identical (copy/cosmetic rewrite): 0.0
         - Proven but below min_gain: base (default 0)
         - Proven and faster: min(speedup, cap) - 1.0
     """
+    rcfg = (_active_config or get_config()).get("reward", {})
+    cap = rcfg.get("cap", 4.0) if cap is None else cap
+    min_gain = rcfg.get("min_gain", 1.05) if min_gain is None else min_gain
+    base = rcfg.get("base", 0.0) if base is None else base
+
     if r.status != "proven":
         return 0.0
     if r.near_identical:
@@ -200,6 +212,8 @@ def _cache_put(task_id: str, candidate_src: str, result: EvalResult):
                 "check_time_s": result.check_time_s,
                 "test_result": result.test_result,
                 "verify_result": result.verify_result,
+                "overlap_check": result.overlap_check,
+                "near_identical": result.near_identical,
                 "details": result.details,
             })
         except Exception:

@@ -74,13 +74,21 @@ REASON_NO_SIGNATURE = "no_signature"
 REASON_VOID_PARAMS = "void_params"  # function takes no parameters
 REASON_LIBC_NOT_MODELED = "libc_not_modeled"  # calls memset/memcpy/strlen etc. not modeled
 REASON_PARSE_ERROR = "parse_error"
+REASON_EXCLUDED_SOURCE = "excluded_source"  # path matches excluded_path_patterns in config.yaml
 
+
+from .config import get_config as _get_config
 
 # Allow-listed libc functions — only those verified to have correct CBMC models
 # (CBMC 6.11.0, --arch x86_64, with system headers).
 # memcmp NOT included: CBMC model returns wrong values.
-# See DECISIONS.md Decision 12.
-ALLOWED_LIBC_CALLS: set[str] = {"memset", "memcpy", "strlen"}
+# See DECISIONS.md Decision 12 & config.yaml.
+ALLOWED_LIBC_CALLS: set[str] = set(_get_config()["dataset"]["allowed_libc"])
+
+# Case-insensitive path substrings excluded from dataset extraction (see config.yaml).
+EXCLUDED_PATH_PATTERNS: tuple[str, ...] = tuple(
+    p.lower() for p in _get_config()["dataset"]["excluded_path_patterns"]
+)
 
 
 # ---- Type classification ----
@@ -270,12 +278,20 @@ def _count_loc(func_body: str) -> int:
 # ---- Main extraction ----
 
 
-def extract_from_exebench(zst_path: str, split: str) -> Iterator[Eligibility]:
+def extract_from_exebench(
+    zst_path: str,
+    split: str,
+    *,
+    excluded_path_patterns: list[str] | tuple[str, ...] | None = None,
+    allowed_libc: set[str] | list[str] | None = None,
+) -> Iterator[Eligibility]:
     """Stream ExeBench zst-compressed JSONL, check each function's eligibility.
 
     Args:
         zst_path: Path to .jsonl.zst file from ExeBench.
         split: Dataset split name (e.g. "train", "test").
+        excluded_path_patterns: Optional override for excluded path substrings.
+        allowed_libc: Optional override for allowed libc function names.
 
     Yields:
         Eligibility for each function in the file.
@@ -300,10 +316,21 @@ def extract_from_exebench(zst_path: str, split: str) -> Iterator[Eligibility]:
                         record = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    yield _check_eligibility(record, split)
+                    yield _check_eligibility(
+                        record,
+                        split,
+                        excluded_path_patterns=excluded_path_patterns,
+                        allowed_libc=allowed_libc,
+                    )
 
 
-def _check_eligibility(record: dict, split: str) -> Eligibility:
+def _check_eligibility(
+    record: dict,
+    split: str,
+    *,
+    excluded_path_patterns: list[str] | tuple[str, ...] | None = None,
+    allowed_libc: set[str] | list[str] | None = None,
+) -> Eligibility:
     """Check if a single ExeBench record passes eligibility rules."""
     t = record.get("text", record)
 
@@ -317,6 +344,16 @@ def _check_eligibility(record: dict, split: str) -> Eligibility:
 
     # Build a unique task ID
     task_id = f"{split}:{path}:{fname}"
+
+    # 0. Exclude compiler testsuites / synthetic obfuscator repos (config.yaml)
+    patterns = (
+        EXCLUDED_PATH_PATTERNS
+        if excluded_path_patterns is None
+        else tuple(p.lower() for p in excluded_path_patterns)
+    )
+    path_lower = path.lower()
+    if patterns and any(pat in path_lower for pat in patterns):
+        return Eligibility(eligible=False, reason_code=REASON_EXCLUDED_SOURCE)
 
     # 1. Must compile
     if real_error:
@@ -374,6 +411,7 @@ def _check_eligibility(record: dict, split: str) -> Eligibility:
         return Eligibility(eligible=False, reason_code=reason)
 
     # 8. Check for calls to non-allowlisted functions
+    allowed_set = ALLOWED_LIBC_CALLS if allowed_libc is None else set(allowed_libc)
     body_only = _get_body_only(func_def)
     called_fns = _extract_called_functions(body_only)
     for fn_name in called_fns:
@@ -387,7 +425,7 @@ def _check_eligibility(record: dict, split: str) -> Eligibility:
         # Skip the function's own name (self-reference)
         if fn_name == fname:
             continue
-        if fn_name in ALLOWED_LIBC_CALLS:
+        if fn_name in allowed_set:
             continue
         # Check if it's a libc function we don't model
         _LIBC_FUNCTIONS = {"memcmp", "memmove", "strcmp", "strncmp", "strcpy", "strncpy",

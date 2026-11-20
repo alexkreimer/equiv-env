@@ -27,7 +27,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        run: pip install pytest pytest-timeout zstandard
+        run: pip install pytest pytest-timeout zstandard pyyaml
 
       - name: Run golden suite (smoke tests)
         run: |

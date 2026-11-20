@@ -1,5 +1,6 @@
 """equiv — Equivalence Checker Environment for C."""
 
+from .config import load_config, get_config, config_hash
 from .extract import Task, Signature, Eligibility, extract_from_exebench
 from .harness import generate_harness, generate_self_harness, HarnessResult
 from .verify import verify, self_verify, VerifyResult, verify_batch
@@ -8,6 +9,7 @@ from .cache import EvalCache
 from .reward import evaluate, reward, evaluate_batch, EvalResult, init as reward_init
 
 __all__ = [
+    "load_config", "get_config", "config_hash",
     "Task", "Signature", "Eligibility", "extract_from_exebench",
     "generate_harness", "generate_self_harness", "HarnessResult",
     "verify", "self_verify", "VerifyResult", "verify_batch",

@@ -136,3 +136,13 @@ Three golden pairs had incorrect expected verdicts. CBMC results were correct in
 - 026_null_deref: not_equivalent → proven
 
 All 32 golden tests pass (28 parametric + 4 static + 2 memset-specific).
+
+## Decision 14 — Central `config.yaml` and source exclusion rules (2026-11-20)
+
+**Why:** Dataset inspection of the 50k build (793 accepted) showed 43% synthetic/testsuite spam: 238 near-duplicate functions (30%) from a single file (`BreakawayConsulting/gcc/gcc/testsuite/gcc.target/sh/pr49263.c`) and 101 synthetic functions (12.7%, including 71/94 accepted loop tasks) from `tum-i22/obfuscated-programs` (Tigress random functions with dead/1-iteration loops). Meanwhile, tunables were scattered across modules rather than centralized per spec §6.
+
+**Decision:**
+- Added repo-root `config.yaml` and `equiv/config.py` (`load_config`, `get_config`, deterministic `config_hash`).
+- Excluded compiler testsuites (`gcc/testsuite`, `llvm/test`, `clang/test`) and synthetic obfuscator benchmarks (`tigress`, `obfuscated-programs`, `csmith`) in `extract.py` with explicit reason code `excluded_source`.
+- Added per-file (`max_per_file: 10`) and per-repo (`max_per_repo: 200`) caps in `scripts/build_dataset.py` (logged as `cap_exceeded_file` / `cap_exceeded_repo`).
+- Wired `reward.py` (`init` and `reward` defaults) to `config.yaml` and canonical `config_hash()`.

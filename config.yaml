@@ -1,0 +1,43 @@
+# Central configuration for equiv-env (Stage 0 spec §6).
+# Any change here updates config_hash() and invalidates cached evaluations.
+
+cbmc:
+  arch: x86_64
+  maxn: 8
+  unwind_candidates: [10, 34, 66]
+  timeout_s: 60
+  ub_timeout_s: 30
+  memory_limit_gb: 8
+
+dataset:
+  allowed_libc:
+    - memset
+    - memcpy
+    - strlen
+  excluded_path_patterns:
+    # Compiler regression testsuites (tiny codegen micro-tests, heavy near-duplicates)
+    - gcc/testsuite
+    - llvm/test
+    - clang/test
+    # Synthetic / obfuscator-generated benchmarks (random functions, dead loops)
+    - tigress
+    - obfuscated-programs
+    - csmith
+  max_per_file: 10
+  max_per_repo: 200
+  deduplicate: true
+
+tests:
+  n_random: 200
+
+speed:
+  proxy: callgrind
+  arch: armv8.5-a
+
+reward:
+  cap: 4.0
+  min_gain: 1.05
+  base: 0.0
+
+cache:
+  path: data/eval_cache.db

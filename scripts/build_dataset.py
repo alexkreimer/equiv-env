@@ -24,6 +24,7 @@ from dataclasses import asdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from equiv.config import load_config, config_hash
 from equiv.extract import extract_from_exebench, Task
 from equiv.harness import generate_self_harness
 from equiv.verify import check_original_ub, _run_cbmc_raw
@@ -108,8 +109,20 @@ def build_dataset(
     output_test: str = "data/tasks_test.jsonl",
     output_rejected: str = "data/rejected.jsonl",
     max_functions: int | None = None,
+    config_path: str | None = None,
 ):
     """Run the full dataset build pipeline."""
+    cfg = load_config(config_path)
+    cbmc_cfg = cfg["cbmc"]
+    ds_cfg = cfg["dataset"]
+    maxn = int(cbmc_cfg["maxn"])
+    timeout_s = float(cbmc_cfg["timeout_s"])
+    ub_timeout_s = float(cbmc_cfg["ub_timeout_s"])
+    excluded_patterns = ds_cfg["excluded_path_patterns"]
+    allowed_libc = set(ds_cfg["allowed_libc"])
+    max_per_file = ds_cfg.get("max_per_file")
+    max_per_repo = ds_cfg.get("max_per_repo")
+
     if data_dir is None:
         data_dir = DATA_DIR
 
@@ -127,16 +140,33 @@ def build_dataset(
             return "test"  # add valid to test pool per Task C
         return "train"
 
+    def _source_keys(task_id: str) -> tuple[str, str]:
+        """Extract (file_path, owner/repo) from task_id 'split:path:fname'."""
+        parts = task_id.split(":")
+        file_path = parts[1] if len(parts) > 1 else task_id
+        segs = file_path.split("/")
+        repo = "/".join(segs[:2]) if len(segs) >= 2 else file_path
+        return file_path, repo
+
     funnel = Counter()
+    accepted_per_file = Counter()
+    accepted_per_repo = Counter()
     accepted_train = []
     accepted_test = []
     rejected = []
     self_check_times = []
 
+    print(f"Config hash: {config_hash(cfg)}")
+
     total = 0
     for zst_path in zst_files:
         split = get_split(zst_path)
-        for result in extract_from_exebench(zst_path, split):
+        for result in extract_from_exebench(
+            zst_path,
+            split,
+            excluded_path_patterns=excluded_patterns,
+            allowed_libc=allowed_libc,
+        ):
             total += 1
 
             if not result.eligible:
@@ -147,6 +177,19 @@ def build_dataset(
                 continue
 
             task = result.task
+            task.maxn = maxn
+            file_key, repo_key = _source_keys(task.task_id)
+
+            if max_per_file and accepted_per_file[file_key] >= max_per_file:
+                funnel["cap_exceeded_file"] += 1
+                rejected.append({"task_id": task.task_id, "reason_code": "cap_exceeded_file", "split": split})
+                continue
+
+            if max_per_repo and accepted_per_repo[repo_key] >= max_per_repo:
+                funnel["cap_exceeded_repo"] += 1
+                rejected.append({"task_id": task.task_id, "reason_code": "cap_exceeded_repo", "split": split})
+                continue
+
             funnel["eligible"] += 1
 
             # Compile check
@@ -158,7 +201,7 @@ def build_dataset(
             funnel["compile_pass"] += 1
 
             # UB check
-            ub_free, ranges = check_original_ub(task, timeout_s=30)
+            ub_free, ranges = check_original_ub(task, timeout_s=ub_timeout_s, maxn=maxn)
             if not ub_free:
                 funnel["ub_in_original"] += 1
                 rejected.append({"task_id": task.task_id, "reason_code": "ub_in_original", "split": split})
@@ -169,7 +212,7 @@ def build_dataset(
             funnel["ub_pass"] += 1
 
             # Self-equivalence check
-            passed, check_time, unwind = self_equiv_check(task)
+            passed, check_time, unwind = self_equiv_check(task, timeout_s=timeout_s)
             task.self_check_time_s = check_time
             task.unwind = unwind
             self_check_times.append(check_time)
@@ -180,6 +223,8 @@ def build_dataset(
                 continue
 
             funnel["self_equiv_pass"] += 1
+            accepted_per_file[file_key] += 1
+            accepted_per_repo[repo_key] += 1
 
             # Accept
             if split == "test":
@@ -242,6 +287,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-test", type=str, default="data/tasks_test.jsonl")
     parser.add_argument("--output-rejected", type=str, default="data/rejected.jsonl")
     parser.add_argument("--max-functions", type=int, default=None)
+    parser.add_argument("--config", type=str, default=None, help="Path to config.yaml")
     args = parser.parse_args()
 
     build_dataset(
@@ -250,4 +296,5 @@ if __name__ == "__main__":
         output_test=args.output_test,
         output_rejected=args.output_rejected,
         max_functions=args.max_functions,
+        config_path=args.config,
     )
