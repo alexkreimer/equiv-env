@@ -13,6 +13,7 @@ Usage:
     python scripts/build_dataset.py --data-dir data/ --output data/tasks.jsonl
 """
 
+import re
 import sys
 import os
 import json
@@ -40,6 +41,17 @@ def find_zst_files(data_dir: str) -> list[str]:
             if f.endswith(".jsonl.zst"):
                 results.append(os.path.join(root, f))
     return results
+
+
+def _is_unwind_only_failure(stdout: str, stderr: str) -> bool:
+    """Return True if CBMC failed due to unwinding assertions (not parse/assertion error)."""
+    if "PARSING ERROR" in stderr or "CONVERSION ERROR" in stderr:
+        return False
+    if "VERIFICATION FAILED" not in stdout:
+        return False
+    has_unwind = bool(re.search(r'\[.*\.unwind\.\d+\].*FAILURE', stdout))
+    has_assertion = bool(re.search(r'\[.*\.assertion\.\d+\].*FAILURE', stdout))
+    return has_unwind and not has_assertion
 
 
 def compile_check(task: Task) -> bool:
@@ -73,12 +85,25 @@ def compile_check(task: Task) -> bool:
     return True
 
 
-def self_equiv_check(task: Task, timeout_s: float = 60) -> tuple[bool, float, int]:
-    """Run self-equivalence check with unwind search.
+def self_equiv_check(
+    task: Task,
+    timeout_s: float = 60,
+    unwind_candidates: list[int] | tuple[int, ...] | None = None,
+) -> tuple[bool, float, int]:
+    """Run self-equivalence check with unwind search (spec Step 4).
+
+    Tries each unwind value in `unwind_candidates` (default [maxn+2, 34, 66])
+    in ascending order, advancing ONLY when CBMC fails due to unwinding
+    assertions. Stores the smallest passing unwind bound.
 
     Returns (passed, check_time_s, unwind_used).
     """
-    harness = generate_self_harness(task, unwind=task.unwind)
+    if not unwind_candidates:
+        unwind_candidates = [task.unwind or (task.maxn + 2), 34, 66]
+    # Deduplicate and sort ascending
+    candidates = sorted({int(u) for u in unwind_candidates})
+
+    harness = generate_self_harness(task, maxn=task.maxn, unwind=candidates[0])
     harness_src = harness.harness_src
 
     with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
@@ -86,16 +111,28 @@ def self_equiv_check(task: Task, timeout_s: float = 60) -> tuple[bool, float, in
         harness_path = f.name
 
     try:
-        start = time.monotonic()
-        result = _run_cbmc_raw(harness_path, task.unwind, timeout_s,
-                               extra_flags=["--no-signed-overflow-check"])
-        elapsed = time.monotonic() - start
+        total_elapsed = 0.0
+        last_uw = candidates[0]
+        for uw in candidates:
+            last_uw = uw
+            remaining = max(1.0, timeout_s - total_elapsed)
+            start = time.monotonic()
+            result = _run_cbmc_raw(
+                harness_path, uw, remaining,
+                extra_flags=["--no-signed-overflow-check"],
+            )
+            elapsed = time.monotonic() - start
+            total_elapsed += elapsed
 
-        if "VERIFICATION SUCCESSFUL" in result.stdout:
-            return True, elapsed, task.unwind
-        return False, elapsed, task.unwind
+            if "VERIFICATION SUCCESSFUL" in result.stdout:
+                return True, elapsed, uw
+            if not _is_unwind_only_failure(result.stdout, result.stderr):
+                return False, total_elapsed, uw
+            if total_elapsed >= timeout_s:
+                return False, total_elapsed, uw
+        return False, total_elapsed, last_uw
     except subprocess.TimeoutExpired:
-        return False, timeout_s, task.unwind
+        return False, timeout_s, last_uw
     finally:
         try:
             os.unlink(harness_path)
@@ -116,6 +153,7 @@ def build_dataset(
     cbmc_cfg = cfg["cbmc"]
     ds_cfg = cfg["dataset"]
     maxn = int(cbmc_cfg["maxn"])
+    unwind_candidates = [int(u) for u in cbmc_cfg.get("unwind_candidates", [maxn + 2, 34, 66])]
     timeout_s = float(cbmc_cfg["timeout_s"])
     ub_timeout_s = float(cbmc_cfg["ub_timeout_s"])
     excluded_patterns = ds_cfg["excluded_path_patterns"]
@@ -159,6 +197,7 @@ def build_dataset(
     print(f"Config hash: {config_hash(cfg)}")
 
     total = 0
+    initial_unwind = min(unwind_candidates)
     for zst_path in zst_files:
         split = get_split(zst_path)
         for result in extract_from_exebench(
@@ -178,6 +217,7 @@ def build_dataset(
 
             task = result.task
             task.maxn = maxn
+            task.unwind = initial_unwind
             file_key, repo_key = _source_keys(task.task_id)
 
             if max_per_file and accepted_per_file[file_key] >= max_per_file:
@@ -200,8 +240,10 @@ def build_dataset(
 
             funnel["compile_pass"] += 1
 
-            # UB check
-            ub_free, ranges = check_original_ub(task, timeout_s=ub_timeout_s, maxn=maxn)
+            # UB check (at initial unwind)
+            ub_free, ranges = check_original_ub(
+                task, timeout_s=ub_timeout_s, maxn=maxn, unwind=initial_unwind
+            )
             if not ub_free:
                 funnel["ub_in_original"] += 1
                 rejected.append({"task_id": task.task_id, "reason_code": "ub_in_original", "split": split})
@@ -211,8 +253,10 @@ def build_dataset(
                 task.input_ranges = ranges
             funnel["ub_pass"] += 1
 
-            # Self-equivalence check
-            passed, check_time, unwind = self_equiv_check(task, timeout_s=timeout_s)
+            # Self-equivalence check with unwind search
+            passed, check_time, unwind = self_equiv_check(
+                task, timeout_s=timeout_s, unwind_candidates=unwind_candidates
+            )
             task.self_check_time_s = check_time
             task.unwind = unwind
             self_check_times.append(check_time)
@@ -221,6 +265,18 @@ def build_dataset(
                 funnel["self_equiv_fail"] += 1
                 rejected.append({"task_id": task.task_id, "reason_code": "self_equiv_fail", "split": split})
                 continue
+
+            # If unwind search succeeded at a deeper bound, verify UB holds at full depth too
+            if unwind > initial_unwind:
+                ub_free_deep, ranges_deep = check_original_ub(
+                    task, timeout_s=ub_timeout_s, maxn=maxn, unwind=unwind
+                )
+                if not ub_free_deep:
+                    funnel["ub_in_original"] += 1
+                    rejected.append({"task_id": task.task_id, "reason_code": "ub_in_original", "split": split})
+                    continue
+                if ranges_deep and not task.input_ranges:
+                    task.input_ranges = ranges_deep
 
             funnel["self_equiv_pass"] += 1
             accepted_per_file[file_key] += 1
