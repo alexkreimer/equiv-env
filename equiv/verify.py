@@ -316,52 +316,120 @@ def _get_counterexample(
     return _parse_trace(proc.stdout)
 
 
+_TRACE_STATE_RE = re.compile(r'^State \d+ .*? function (\S+)')
+_TRACE_ASSIGN_RE = re.compile(r'^\s*([A-Za-z_][\w$]*)(?:\[(\d+)[a-z]*\])?=(.*)$')
+_TRACE_TOKEN_RE = re.compile(r"'(?:\\.|[^'\\])'|[^,\s{}]+")
+_TRACE_HEAD_VAL_RE = re.compile(r"^('(?:\\.|[^'\\])'|\S+)")
+_TRACE_INT_RE = re.compile(r'^(-?\d+)(?:[uUlL]+)?$')
+
+
+def _first_trace_token(rest: str) -> str:
+    """Extract the leading value token (preserving `' '` space char literals)."""
+    m = _TRACE_HEAD_VAL_RE.match(rest.lstrip())
+    return m.group(1) if m else ""
+
+
+def _parse_trace_value(tok: str) -> int | None:
+    """Parse one CBMC trace value token (`8`, `-1`, `4294967295u`, `'a'`, `TRUE`)."""
+    tok = tok.strip()
+    m = _TRACE_INT_RE.match(tok)
+    if m:
+        return int(m.group(1))
+    if tok == "TRUE":
+        return 1
+    if tok == "FALSE":
+        return 0
+    if len(tok) >= 3 and tok[0] == "'" and tok[-1] == "'":
+        body = tok[1:-1]
+        try:
+            return ord(body.encode().decode("unicode_escape")) if body.startswith("\\") else ord(body)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _parse_trace(stdout: str) -> dict | None:
-    """Parse CBMC trace output to extract counterexample values.
+    """Parse the first CBMC counterexample trace.
 
-    Returns a dict with input variable names mapped to their values.
+    Returns a dict:
+      inputs:   {scalar_param: "value"}
+      buffers:  {pointer_param: [int, ...]}   (contents *before* the call)
+      kind:     "mismatch" (an equivalence assertion failed) or "ub" (a CBMC
+                safety property failed, e.g. out-of-bounds in the candidate)
+      violated_property: CBMC property id, e.g. "harness.assertion.1"
+      original_return / candidate_return: ints when present
+
+    Inputs/buffers are recorded only while the trace is still inside
+    `harness` (i.e. before orig__/cand__ run), because the functions under
+    test may overwrite their buffers and we need the *initial* values.
     """
-    ce: dict = {"inputs": {}}
-
-    # Extract state assignments from the trace
-    # Pattern: State N file ... line L ... variable=value
-    # or: x=151519248 (00001001 00001000 00000000 00010000)
+    ce: dict = {"inputs": {}, "buffers": {}}
     trace_started = False
-    for line in stdout.split("\n"):
-        if "Trace for" in line:
-            trace_started = True
-            continue
+    in_harness = True
 
+    for line in stdout.split("\n"):
+        m_trace = re.match(r'^Trace for (\S+?):', line)
+        if m_trace:
+            if trace_started:      # only the first failing property
+                break
+            trace_started = True
+            prop = m_trace.group(1)
+            ce["violated_property"] = prop
+            ce["kind"] = "mismatch" if ".assertion." in prop else "ub"
+            continue
         if not trace_started:
             continue
 
-        # Match: variable_name=value (binary)
-        match = re.search(r'^\s*(\w+)=(-?\d+)\s', line)
-        if match:
-            name = match.group(1)
-            value = match.group(2)
-            # Skip internal CBMC variables
-            if name.startswith("goto_symex") or name.startswith("return_value"):
-                continue
-            if name.startswith("__"):
-                continue
-            if name not in ce["inputs"]:
-                ce["inputs"][name] = value
+        m_state = _TRACE_STATE_RE.match(line)
+        if m_state:
+            if m_state.group(1) != "harness":
+                in_harness = False
+            continue
 
-        # Match: return_value_orig__NAME=value
-        match_ret = re.search(r'return_value_orig__(\w+)=(-?\d+)', line)
+        match_ret = re.search(r'return_value_orig__\w+=(-?\d+)', line)
         if match_ret:
-            ce["original_return"] = int(match_ret.group(2))
-
-        match_ret = re.search(r'return_value_cand__(\w+)=(-?\d+)', line)
+            ce["original_return"] = int(match_ret.group(1))
+        match_ret = re.search(r'return_value_cand__\w+=(-?\d+)', line)
         if match_ret:
-            ce["candidate_return"] = int(match_ret.group(2))
+            ce["candidate_return"] = int(match_ret.group(1))
 
-        # Stop at "Violated property"
         if "Violated property" in line:
             break
+        if not in_harness:
+            continue
 
-    return ce if ce.get("inputs") else None
+        m = _TRACE_ASSIGN_RE.match(line)
+        if not m:
+            continue
+        name, idx, rest = m.group(1), m.group(2), m.group(3)
+        if name.startswith(("goto_symex", "return_value", "__")) or "$" in name:
+            continue
+
+        if name.endswith("_c") or name.endswith("_m"):
+            continue                       # candidate copies mirror the originals
+        if name.endswith("_o"):
+            param = name[:-2]
+            buf = ce["buffers"].setdefault(param, [])
+            if idx is not None:            # element assignment: a_o[3l]=5 or a_o[0l]=' '
+                i = int(idx)
+                val = _parse_trace_value(_first_trace_token(rest))
+                if val is not None:
+                    if len(buf) <= i:
+                        buf.extend([0] * (i + 1 - len(buf)))
+                    buf[i] = val
+            elif rest.lstrip().startswith("{"):   # whole array: a_o={ 0, 1 } (...)
+                body = rest.lstrip()[1:]
+                body = body.split("}", 1)[0]
+                vals = [_parse_trace_value(t) for t in _TRACE_TOKEN_RE.findall(body)]
+                ce["buffers"][param] = [v if v is not None else 0 for v in vals]
+            continue
+
+        if idx is None and name not in ce["inputs"]:
+            val = _parse_trace_value(_first_trace_token(rest))
+            if val is not None:
+                ce["inputs"][name] = str(val)
+
+    return ce if (ce["inputs"] or ce["buffers"]) else None
 
 
 def verify_batch(

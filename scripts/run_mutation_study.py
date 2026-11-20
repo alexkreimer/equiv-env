@@ -12,6 +12,7 @@ from equiv.extract import extract_from_exebench, Task, Signature
 from equiv.harness import generate_harness, _filter_deps, HEADER, _rename_function
 from equiv.verify import verify
 from equiv.mutate import mutate
+from equiv.replay import replay_counterexample
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 
@@ -55,14 +56,20 @@ def _compile_and_run(driver_src: str, timeout_s: int = 30) -> str:
 
 def heavy_random_test(task, original_src: str, mutant_src: str, n_inputs: int = 1000) -> str:
     """Heavy random testing to determine ground truth. Uses 1000 inputs (not 100k for speed)."""
-    sig = task.signature
+    from equiv.extract import get_paired_length_params
+    from equiv.harness import _header_for_task, _pointee_type, _clean_type_str
+    from equiv.replay import _strip_inline
 
-    orig = _rename_function(original_src, task.func_name, "orig_func") or original_src
-    mut = _rename_function(mutant_src, task.func_name, "mut_func") or mutant_src
+    sig = task.signature
+    pointer_rules = task.pointer_rules or {}
+    paired_lengths = get_paired_length_params(sig, pointer_rules)
+
+    orig = _strip_inline(_rename_function(original_src, task.func_name, "orig_func") or original_src)
+    mut = _strip_inline(_rename_function(mutant_src, task.func_name, "mut_func") or mutant_src)
 
     # Build driver — try without deps first, then with deps
     for include_deps in [False, True]:
-        parts = [HEADER, "#define MAXN 8"]
+        parts = [_header_for_task(task), "#define MAXN 8"]
         if include_deps and task.deps_src:
             filtered = _filter_deps(task.deps_src)
             if filtered: parts.append(filtered)
@@ -72,20 +79,25 @@ def heavy_random_test(task, original_src: str, mutant_src: str, n_inputs: int = 
         for _ in range(min(n_inputs, 1000)):
             parts.append("  {")
             for name, c_type in sig.params:
-                if c_type.endswith("*"):
-                    p = c_type.rstrip("*").replace("const ", "").strip()
+                if c_type.strip().endswith("*"):
+                    p = _pointee_type(c_type)
                     parts.append(f"    {p} {name}_o[MAXN], {name}_m[MAXN];")
                     parts.append(f"    for (int __i = 0; __i < MAXN; __i++) {{ int __v = rand(); {name}_o[__i] = ({p})__v; {name}_m[__i] = ({p})__v; }}")
+                    if pointer_rules.get(name) == "string":
+                        parts.append(f"    int __z_{name} = rand() % MAXN; {name}_o[__z_{name}] = 0; {name}_m[__z_{name}] = 0;")
+                elif name in paired_lengths:
+                    parts.append(f"    {_clean_type_str(c_type)} {name} = ({_clean_type_str(c_type)})(rand() % (MAXN + 1));")
                 else:
-                    parts.append(f"    {c_type} {name} = ({c_type})rand();")
-            oa = [f"{n}_o" if t.endswith("*") else n for n, t in sig.params]
-            ma = [f"{n}_m" if t.endswith("*") else n for n, t in sig.params]
-            if sig.return_type != "void":
+                    parts.append(f"    {_clean_type_str(c_type)} {name} = ({_clean_type_str(c_type)})rand();")
+            oa = [f"{n}_o" if t.strip().endswith("*") else n for n, t in sig.params]
+            ma = [f"{n}_m" if t.strip().endswith("*") else n for n, t in sig.params]
+            ret = _clean_type_str(sig.return_type)
+            if ret != "void" and not ret.endswith("*"):
                 parts.append(f"    if (orig_func({', '.join(oa)}) != mut_func({', '.join(ma)})) {{ printf(\"DIFFERS\\n\"); return 1; }}")
             else:
                 parts.append(f"    orig_func({', '.join(oa)}); mut_func({', '.join(ma)});")
             for name, c_type in sig.params:
-                if c_type.endswith("*"):
+                if c_type.strip().endswith("*"):
                     parts.append(f"    for (int __i = 0; __i < MAXN; __i++) if ({name}_o[__i] != {name}_m[__i]) {{ printf(\"DIFFERS\\n\"); return 1; }}")
             parts.append("  }")
         parts.append('  printf("SAME\\n"); return 0; }')
@@ -93,43 +105,6 @@ def heavy_random_test(task, original_src: str, mutant_src: str, n_inputs: int = 
         result = _compile_and_run("\n".join(parts))
         if result != "unknown": return result
     return "unknown"
-
-
-def replay_counterexample(task, mutant_src: str, ce: dict) -> str:
-    """Replay counterexample. Returns 'replayed' or 'failed'."""
-    if not ce or not ce.get("inputs"): return "not_applicable"
-    sig = task.signature; inputs = ce["inputs"]
-
-    orig = _rename_function(task.func_src, task.func_name, "orig_func") or task.func_src
-    mut = _rename_function(mutant_src, task.func_name, "mut_func") or mutant_src
-
-    parts = [HEADER]
-    if task.deps_src:
-        filtered = _filter_deps(task.deps_src)
-        if filtered: parts.append(filtered)
-    parts.append(orig); parts.append(mut)
-    parts.append("#include <stdio.h>\nint main(void) {")
-
-    for name, c_type in sig.params:
-        if c_type.endswith("*"):
-            p = c_type.rstrip("*").replace("const ", "").strip()
-            parts.append(f"  {p} {name}_o[8]={{0}}, {name}_m[8]={{0}};")
-        else:
-            parts.append(f"  {c_type} {name} = {inputs.get(name, '0')};")
-
-    oa = [f"{n}_o" if t.endswith("*") else n for n, t in sig.params]
-    ma = [f"{n}_m" if t.endswith("*") else n for n, t in sig.params]
-    if sig.return_type != "void":
-        parts.append(f"  if (orig_func({', '.join(oa)}) != mut_func({', '.join(ma)})) {{ printf(\"DIFFERS\\n\"); return 0; }}")
-    else:
-        parts.append(f"  orig_func({', '.join(oa)}); mut_func({', '.join(ma)});")
-    for name, c_type in sig.params:
-        if c_type.endswith("*"):
-            parts.append(f"  for (int __i = 0; __i < 8; __i++) if ({name}_o[__i] != {name}_m[__i]) {{ printf(\"DIFFERS\\n\"); return 0; }}")
-    parts.append('  printf("SAME\\n"); return 1; }')
-
-    result = _compile_and_run("\n".join(parts), timeout_s=10)
-    return "replayed" if result == "differs" else "failed"
 
 
 def run_single_mutant(args) -> MutantResult:
@@ -140,7 +115,7 @@ def run_single_mutant(args) -> MutantResult:
         vr = verify(task, mutant_src, timeout_s=60, extra_cbmc_flags=None)
         r.cbmc_verdict = vr.status; r.check_time_s = time.monotonic() - start
         if vr.status == "not_equivalent" and vr.counterexample:
-            r.counterexample_replay = replay_counterexample(task, mutant_src, vr.counterexample)
+            r.counterexample_replay = replay_counterexample(task, mutant_src, vr.counterexample).status
     except Exception as e:
         r.cbmc_verdict = f"error:{e}"; r.check_time_s = time.monotonic() - start; return r
     try:
@@ -214,7 +189,10 @@ def run_mutation_study(n_tasks=500, mutants_per_task=3, n_workers=1, data_dir=No
     print(f"False proofs: {len(false_proofs)} (target: 0)")
     if false_proofs:
         for fp in false_proofs[:5]: print(f"  FALSE PROOF: {fp.task_id} op={fp.operator}")
-    print(f"CE replay: {sum(1 for r in ce_results if r.counterexample_replay=='replayed')}/{len(ce_results)} replayed")
+    by_status = Counter(r.counterexample_replay for r in ce_results)
+    print(f"CE replay: {by_status['replayed']}/{len(ce_results)} replayed "
+          f"({by_status['not_reproduced']} not_reproduced = possible checker bugs, "
+          f"{by_status['driver_error']} driver_error = replay tooling problems)")
     print(f"Time: {elapsed:.1f}s")
     return results
 
