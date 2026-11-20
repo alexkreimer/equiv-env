@@ -84,12 +84,12 @@ def run_tests(
     # Random inputs
     sig = task.signature
     for _ in range(n_random):
-        test_input = _generate_random_input(sig, task.pointer_rules, maxn)
+        test_input = _generate_random_input(sig, task.pointer_rules, maxn, task.input_ranges)
         tests.append(test_input)
 
     # Edge values
     if include_edges:
-        edge_inputs = _generate_edge_inputs(sig, task.pointer_rules, maxn)
+        edge_inputs = _generate_edge_inputs(sig, task.pointer_rules, maxn, task.input_ranges)
         tests.extend(edge_inputs)
 
     if not tests:
@@ -117,13 +117,23 @@ def run_tests(
     return result
 
 
-def _generate_random_input(sig, pointer_rules: dict, maxn: int) -> dict:
-    """Generate one set of random inputs matching the function signature."""
+def _generate_random_input(
+    sig, pointer_rules: dict, maxn: int, input_ranges: dict | None = None
+) -> dict:
+    """Generate one set of random inputs matching the function signature,
+    respecting paired length bounds [0, maxn] and task.input_ranges."""
+    from .extract import get_paired_length_params
+    from .harness import _type_bounds
+
+    paired_lengths = get_paired_length_params(sig, pointer_rules)
+    ranges = input_ranges or {}
+    narrowed = bool(ranges.get("_narrowed"))
+    buf_range = ranges.get("_buf_range", (-32768, 32767))
+
     inp = {}
     for name, c_type in sig.params:
-        if c_type.endswith("*"):
+        if c_type.strip().endswith("*"):
             pointee = c_type.rstrip("*").replace("const ", "").strip()
-            # Generate random array of maxn elements
             if "char" in pointee and pointer_rules.get(name) == "string":
                 length = random.randint(0, maxn - 1)
                 arr = [random.randint(32, 126) for _ in range(length)] + [0]
@@ -131,62 +141,108 @@ def _generate_random_input(sig, pointer_rules: dict, maxn: int) -> dict:
                 while len(arr) < maxn:
                     arr.append(0)
             else:
-                arr = _random_scalar_array(pointee, maxn)
+                if narrowed:
+                    tmin, tmax, _ = _type_bounds(pointee)
+                    lo = max(int(buf_range[0]), tmin)
+                    hi = min(int(buf_range[1]), tmax)
+                    arr = [random.randint(lo, hi) for _ in range(maxn)]
+                else:
+                    arr = _random_scalar_array(pointee, maxn)
             inp[name] = arr
+        elif name in paired_lengths:
+            inp[name] = random.randint(0, maxn)
+        elif name in ranges and isinstance(ranges[name], (list, tuple)) and len(ranges[name]) == 2:
+            inp[name] = random.randint(int(ranges[name][0]), int(ranges[name][1]))
+        elif narrowed:
+            tmin, tmax, _ = _type_bounds(c_type)
+            inp[name] = random.randint(max(-32768, tmin), min(32767, tmax))
         else:
             inp[name] = _random_scalar(c_type)
     return inp
 
 
-def _generate_edge_inputs(sig, pointer_rules: dict, maxn: int) -> list[dict]:
-    """Generate edge-case test inputs (0, 1, -1, INT_MIN, empty buffers, full buffers)."""
+def _generate_edge_inputs(
+    sig, pointer_rules: dict, maxn: int, input_ranges: dict | None = None
+) -> list[dict]:
+    """Generate edge-case test inputs (0, 1, -1, bounds, empty/full buffers)."""
+    from .extract import get_paired_length_params
+    from .harness import _type_bounds
+
+    paired_lengths = get_paired_length_params(sig, pointer_rules)
+    ranges = input_ranges or {}
+    narrowed = bool(ranges.get("_narrowed"))
     inputs = []
+
+    def _default_scalar(n2: str, t2: str) -> int:
+        if n2 in paired_lengths:
+            return min(1, maxn)
+        return 0
+
+    def _default_buf(n2: str, t2: str) -> list[int]:
+        if pointer_rules.get(n2) == "string":
+            return [0] * maxn
+        return [0] * maxn
 
     # Collect edge scalars per type
     for name, c_type in sig.params:
-        if not c_type.endswith("*"):
-            base_type = c_type.replace("const ", "").strip()
-            edges = EDGE_VALUES.get(base_type, [0, 1, -1])
+        if not c_type.strip().endswith("*"):
+            if name in paired_lengths:
+                edges = sorted({0, 1, maxn // 2, max(0, maxn - 1), maxn})
+            else:
+                base_type = c_type.replace("const ", "").strip()
+                raw_edges = EDGE_VALUES.get(base_type, [0, 1, -1])
+                if name in ranges and isinstance(ranges[name], (list, tuple)) and len(ranges[name]) == 2:
+                    lo, hi = int(ranges[name][0]), int(ranges[name][1])
+                    edges = [v for v in raw_edges if lo <= v <= hi] + [lo, hi]
+                elif narrowed:
+                    tmin, tmax, _ = _type_bounds(c_type)
+                    lo, hi = max(-32768, tmin), min(32767, tmax)
+                    edges = [v for v in raw_edges if lo <= v <= hi] + [lo, hi]
+                else:
+                    edges = raw_edges
             for val in edges:
                 inp = {}
                 for n2, t2 in sig.params:
                     if n2 == name:
                         inp[n2] = val
-                    elif t2.endswith("*"):
-                        inp[n2] = [0] * maxn
+                    elif t2.strip().endswith("*"):
+                        inp[n2] = _default_buf(n2, t2)
                     else:
-                        inp[n2] = 0
+                        inp[n2] = _default_scalar(n2, t2)
                 inputs.append(inp)
 
     # Empty and full buffers for pointer params
     for name, c_type in sig.params:
-        if c_type.endswith("*"):
+        if c_type.strip().endswith("*"):
             pointee = c_type.rstrip("*").replace("const ", "").strip()
             # Empty buffer (all zeros)
             inp = {}
             for n2, t2 in sig.params:
                 if n2 == name:
                     inp[n2] = [0] * maxn
-                elif t2.endswith("*"):
-                    inp[n2] = [1] * maxn  # non-zero default
+                elif t2.strip().endswith("*"):
+                    inp[n2] = ([65] * (maxn - 1) + [0]) if pointer_rules.get(n2) == "string" else [1] * maxn
                 else:
-                    inp[n2] = 1
+                    inp[n2] = _default_scalar(n2, t2)
             inputs.append(inp)
 
-            # Full buffer (max values)
+            # Full buffer (max values, null-terminated if string)
             inp = {}
             for n2, t2 in sig.params:
                 if n2 == name:
-                    if "char" in pointee:
+                    if pointer_rules.get(n2) == "string":
+                        inp[n2] = [126] * (maxn - 1) + [0]
+                    elif "char" in pointee:
                         inp[n2] = [127] * maxn
                     elif "unsigned" in c_type:
                         inp[n2] = [255] * maxn
                     else:
-                        inp[n2] = [1000000] * maxn
-                elif t2.endswith("*"):
-                    inp[n2] = [1] * maxn
+                        val = 32767 if narrowed else 1000000
+                        inp[n2] = [val] * maxn
+                elif t2.strip().endswith("*"):
+                    inp[n2] = ([65] * (maxn - 1) + [0]) if pointer_rules.get(n2) == "string" else [1] * maxn
                 else:
-                    inp[n2] = 1
+                    inp[n2] = _default_scalar(n2, t2)
             inputs.append(inp)
 
     return inputs[:50]  # cap edges

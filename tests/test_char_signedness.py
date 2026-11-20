@@ -11,6 +11,7 @@ import sys
 
 TEST_FILE = os.path.join(
     os.path.dirname(__file__),
+    "golden",
     "001_char_signedness",
     "test.c",
 )
@@ -22,10 +23,16 @@ def _compile_and_run(compiler: str, flags: list[str]) -> int:
         out_path = f.name
 
     try:
+        # Verify TEST_FILE compiles cleanly as an object file (CBMC harness has no main)
+        obj_path = out_path + ".o"
         result = subprocess.run(
-            [compiler] + flags + ["-o", out_path, TEST_FILE],
+            [compiler] + flags + ["-c", "-o", obj_path, TEST_FILE],
             capture_output=True, text=True, timeout=10,
         )
+        try:
+            os.unlink(obj_path)
+        except OSError:
+            pass
         if result.returncode != 0:
             raise RuntimeError(f"Compilation failed: {result.stderr[:200]}")
 
