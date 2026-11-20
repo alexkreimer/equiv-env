@@ -1,11 +1,18 @@
-"""Regression tests for dataset/harness bugfixes."""
+"""Regression tests for the 4 dataset/harness bugs:
+
+1. ExeBench mangled func_head (`intn`, `intlen`, `intsize`) parsed from func_def
+2. UB-in-original harness applies `string` null-terminators and `paired` length bounds
+3. Main & overlap harnesses emit paired length bounds, apply input_ranges safely
+   (no unsatisfiable unsigned >= -32768), and compare pointer returns by same-object offset
+4. Unwind search tries [10, 34, 66] for fixed-bound loops (e.g. 32-iteration loops)
+"""
 
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from equiv.extract import _check_eligibility, get_paired_length_params
+from equiv.extract import _check_eligibility, get_paired_length_params, has_input_dependent_loop
 from equiv.harness import generate_harness, generate_overlap_harness, generate_ub_harness, _emit_range_assume
 from equiv.verify import check_original_ub, self_verify
 from scripts.build_dataset import self_equiv_check
@@ -36,6 +43,7 @@ def test_mangled_func_head_parsed_from_func_def():
     assert elig.task.signature.params == [("a", "int *"), ("n", "int")]
     assert elig.task.pointer_rules == {"a": "paired"}
     assert get_paired_length_params(elig.task.signature, elig.task.pointer_rules) == {"n"}
+    assert has_input_dependent_loop(elig.task.func_src, elig.task.signature)
 
 
 def test_bare_unsigned_and_array_size_params():
