@@ -266,8 +266,8 @@ def _filter_deps(deps: str) -> str:
     filtered = []
     for line in lines:
         stripped = line.strip()
-        # Skip #include lines
-        if stripped.startswith("#include"):
+        # Skip #include lines and stray preprocessor line markers like `# 1 `
+        if stripped.startswith("#include") or _re.match(r'^#\s*\d+\b', stripped):
             continue
         if not stripped:
             continue
@@ -281,6 +281,19 @@ def _filter_deps(deps: str) -> str:
             continue
         filtered.append(line)
     return "\n".join(filtered)
+
+
+def _header_for_task(task: Task) -> str:
+    """Return standard includes, adding <stdbool.h> unless deps_src defines `bool`."""
+    deps = task.deps_src or ""
+    defines_bool = bool(
+        re.search(r'\btypedef\b[^;]*\bbool\s*;', deps)
+        or re.search(r'^\s*#\s*define\s+bool\b', deps, flags=re.MULTILINE)
+        or re.search(r'\benum\b[^;]*\bbool\b', deps)
+    )
+    if defines_bool:
+        return HEADER
+    return HEADER + "#include <stdbool.h>\n"
 
 
 # ---- Harness generation ----
@@ -313,7 +326,7 @@ def generate_harness(task: Task, candidate_src: str, maxn: int = 8, unwind: int 
     parts = []
 
     # 1. Header includes
-    parts.append(HEADER)
+    parts.append(_header_for_task(task))
 
     # 2. Dependency declarations (type definitions, macros)
     if task.deps_src:
@@ -514,6 +527,32 @@ def _emit_buffer_inits(
     return lines
 
 
+def _emit_return_assert(sig: Signature, pointer_params: list[tuple[str, str]], buf_suffix_o: str = "_o", buf_suffix_c: str = "_c") -> list[str]:
+    """Emit return-value equivalence assertion (handling pointer returns safely)."""
+    lines: list[str] = []
+    ret_clean = _clean_type_str(sig.return_type)
+    if ret_clean == "void":
+        return lines
+
+    if ret_clean.endswith("*") and pointer_params:
+        # Compare pointer returns by same-object + offset (never compare addresses of distinct arrays)
+        lines.append("  if (__r_o == NULL) {")
+        lines.append("    assert(__r_c == NULL);")
+        for name, _ in pointer_params:
+            o_buf = f"{name}{buf_suffix_o}"
+            c_buf = f"{name}{buf_suffix_c}"
+            lines.append("#ifdef __CPROVER__")
+            lines.append(f"  }} else if (__CPROVER_same_object(__r_o, {o_buf})) {{")
+            lines.append(f"    assert(__CPROVER_same_object(__r_c, {c_buf}) && (__r_o - {o_buf}) == (__r_c - {c_buf}));")
+            lines.append("#endif")
+        lines.append("  } else {")
+        lines.append("    assert(__r_o == __r_c);")
+        lines.append("  }")
+    else:
+        lines.append("  assert(__r_o == __r_c);")
+    return lines
+
+
 def _generate_harness_body(task: Task, maxn: int) -> str:
     """Generate the body of the equivalence harness function."""
     lines: list[str] = []
@@ -556,9 +595,7 @@ def _generate_harness_body(task: Task, maxn: int) -> str:
     # Step 4: Assert equivalence
     lines.append("")
     lines.append("  /* 4. Assert equivalence */")
-
-    if not ret_is_void:
-        lines.append("  assert(__r_o == __r_c);")
+    lines.extend(_emit_return_assert(sig, pointer_params))
 
     # Assert buffer equality post-call
     for name, _ in pointer_params:
@@ -582,7 +619,7 @@ def generate_ub_harness(
         unwind = maxn + 2
 
     parts: list[str] = []
-    parts.append(HEADER)
+    parts.append(_header_for_task(task))
 
     if task.deps_src:
         filtered_deps = _filter_deps(task.deps_src)
@@ -761,7 +798,7 @@ def generate_overlap_harness(task: Task, candidate_src: str,
     pointee = pointees[0]
 
     parts = []
-    parts.append(HEADER)
+    parts.append(_header_for_task(task))
     parts.append(f"#define MAXN {maxn}")
     parts.append(f"/* Overlap harness — all {len(pointer_params)} pointers share one buffer */")
 
@@ -847,7 +884,18 @@ def generate_overlap_harness(task: Task, candidate_src: str,
     if not ret_void:
         parts.append(f"  {ret_clean} __r_o = orig__{task.func_name}({', '.join(orig_args)});")
         parts.append(f"  {ret_clean} __r_c = cand__{task.func_name}({', '.join(cand_args)});")
-        parts.append("  assert(__r_o == __r_c);")
+        if ret_clean.endswith("*"):
+            parts.append("  if (__r_o == NULL) {")
+            parts.append("    assert(__r_c == NULL);")
+            parts.append("#ifdef __CPROVER__")
+            parts.append("  } else if (__CPROVER_same_object(__r_o, shared_o)) {")
+            parts.append("    assert(__CPROVER_same_object(__r_c, shared_c) && (__r_o - shared_o) == (__r_c - shared_c));")
+            parts.append("#endif")
+            parts.append("  } else {")
+            parts.append("    assert(__r_o == __r_c);")
+            parts.append("  }")
+        else:
+            parts.append("  assert(__r_o == __r_c);")
     else:
         parts.append(f"  orig__{task.func_name}({', '.join(orig_args)});")
         parts.append(f"  cand__{task.func_name}({', '.join(cand_args)});")
