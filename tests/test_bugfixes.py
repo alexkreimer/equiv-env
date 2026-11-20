@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from equiv.extract import _check_eligibility, get_paired_length_params
 from equiv.harness import generate_harness, generate_overlap_harness, generate_ub_harness, _emit_range_assume
 from equiv.verify import check_original_ub, self_verify
+from scripts.build_dataset import self_equiv_check
 
 
 def _make_record(func_head: str, func_def: str, fname: str, path: str = "user/repo/a.c") -> dict:
@@ -144,3 +145,23 @@ def test_overlap_harness_includes_paired_and_string_rules():
     ov = generate_overlap_harness(elig.task, elig.task.func_src, maxn=8)
     assert ov is not None
     assert "__CPROVER_assume(n >= 0 && n <= MAXN);" in ov.harness_src
+
+
+def test_unwind_search_resolves_32_iteration_loop():
+    """Bug 4: self_equiv_check searches [10, 34, 66] so 32-iteration loops pass."""
+    rec = _make_record(
+        func_head="int popcnt32(unsigned intx)",
+        func_def=(
+            "int popcnt32(unsigned int x) {\n"
+            "  int c = 0;\n"
+            "  for (int i = 0; i < 32; i++) if (x & (1u << i)) c++;\n"
+            "  return c;\n"
+            "}"
+        ),
+        fname="popcnt32",
+    )
+    elig = _check_eligibility(rec, "train")
+    assert elig.eligible
+    passed, elapsed, unwind = self_equiv_check(elig.task, timeout_s=30, unwind_candidates=[10, 34, 66])
+    assert passed, "32-iteration loop should pass via unwind search"
+    assert unwind == 34, f"Expected unwind=34, got {unwind}"
