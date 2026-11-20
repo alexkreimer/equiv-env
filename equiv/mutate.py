@@ -114,7 +114,7 @@ def _change_constant(src: str) -> Mutant | None:
     match = random.choice(matches)
     value = int(match.group(1))
     direction = random.choice([-1, 1])
-    new_value = max(0, value + direction)
+    new_value = 1 if value == 0 else value + direction
 
     new_src = src[:match.start()] + str(new_value) + src[match.end():]
     return Mutant(new_src, "change_constant", f"Changed {value} to {new_value}")
