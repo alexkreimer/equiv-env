@@ -291,11 +291,7 @@ def _build_test_driver(
         if filtered:
             parts.append(filtered)
 
-    # Shorthand typedefs for scalar types used in tests
-    parts.append("""typedef long long int64_t;
-typedef unsigned long long uint64_t;
-typedef long intptr_t;
-typedef unsigned long uintptr_t;""")
+    # Standard fixed-width types are already provided by <stdint.h> in HEADER
 
     # Renamed original and candidate
     from .harness import _rename_function, _extract_function_name

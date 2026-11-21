@@ -201,7 +201,10 @@ def replay_counterexample(
     if "SAME" in out:
         # Falling off the end of a non-void candidate function is C UB; at -O0
         # the stale return register can coincidentally equal orig_func's result.
-        if "non-void function does not return a value" in comp_err and "mut_func" in driver:
+        if (
+            "does not return a value" in comp_err
+            or "control reaches end of non-void function" in comp_err
+        ) and "mut_func" in driver:
             return ReplayResult("replayed", "candidate UB: non-void function does not return a value")
         return ReplayResult("not_reproduced", "functions agree on counterexample input")
     return ReplayResult("driver_error", f"unexpected driver output (rc={proc.returncode}): {(out + err)[:200]}")

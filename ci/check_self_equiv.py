@@ -28,9 +28,10 @@ def load_tasks(path):
                 func_src=d["func_src"],
                 deps_src=d.get("deps_src", ""),
                 signature=sig,
-                pointer_rules=d.get("pointer_rules", []),
+                pointer_rules=d.get("pointer_rules", {}),
                 maxn=d.get("maxn", 8),
                 unwind=d.get("unwind", 10),
+                input_ranges=d.get("input_ranges"),
                 n_loops=d.get("n_loops", 0),
                 loc=d.get("loc", 0),
             )
@@ -48,7 +49,7 @@ def main():
     times = []
 
     for i, task in enumerate(tasks):
-        harness = generate_self_harness(task)
+        harness = generate_self_harness(task, maxn=task.maxn, unwind=task.unwind)
         with tempfile.NamedTemporaryFile(
             suffix=".c", mode="w", delete=False
         ) as f:
@@ -68,7 +69,7 @@ def main():
                     "--no-signed-overflow-check",
                     tmp,
                 ],
-                capture_output=True, text=True, timeout=30,
+                capture_output=True, text=True, timeout=60,
             )
             elapsed = time.monotonic() - start
             times.append(elapsed)
