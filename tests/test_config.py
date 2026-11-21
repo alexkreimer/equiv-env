@@ -13,7 +13,7 @@ from equiv.reward import EvalResult, init as reward_init, reward
 
 def test_load_default_config():
     cfg = load_config()
-    assert cfg["cbmc"]["maxn"] == 8
+    assert cfg["cbmc"]["maxn"] == 4
     assert cfg["cbmc"]["arch"] == "x86_64"
     assert "gcc/testsuite" in cfg["dataset"]["excluded_path_patterns"]
     assert "tigress" in cfg["dataset"]["excluded_path_patterns"]
@@ -41,7 +41,7 @@ def test_load_custom_partial_config(tmp_path: Path):
     assert cfg["reward"]["min_gain"] == 1.10
     # Inherited defaults
     assert cfg["reward"]["cap"] == 4.0
-    assert cfg["cbmc"]["maxn"] == 8
+    assert cfg["cbmc"]["maxn"] == 4
 
 
 def test_excluded_source_patterns():

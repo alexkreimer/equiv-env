@@ -816,8 +816,12 @@ def generate_self_harness(task: Task, maxn: int = 8, unwind: int | None = None) 
 
 
 def generate_overlap_harness(task: Task, candidate_src: str,
-                              maxn: int = 8, unwind: int | None = None) -> HarnessResult | None:
+                              maxn: int = 8, unwind: int | None = None,
+                              single: bool = False) -> HarnessResult | None:
     """Generate an overlap-sensitivity harness.
+
+    single=True: safety-only variant that calls task.func_src once on the shared
+    buffer (no second function, no comparison); used by fast-prove.
 
     For tasks with >=2 pointer params of compatible type and no restrict,
     creates a harness where those pointers share one buffer at symbolic offsets.
@@ -864,11 +868,12 @@ def generate_overlap_harness(task: Task, candidate_src: str,
         orig_renamed = task.func_src
     parts.append(orig_renamed)
 
-    cand_name = _extract_function_name(candidate_src) or task.func_name
-    cand_renamed = _rename_function(candidate_src, cand_name, f"cand__{task.func_name}")
-    if cand_renamed is None:
-        cand_renamed = candidate_src
-    parts.append(cand_renamed)
+    if not single:
+        cand_name = _extract_function_name(candidate_src) or task.func_name
+        cand_renamed = _rename_function(candidate_src, cand_name, f"cand__{task.func_name}")
+        if cand_renamed is None:
+            cand_renamed = candidate_src
+        parts.append(cand_renamed)
 
     # Harness
     parts.append("void harness(void) {")
@@ -888,14 +893,16 @@ def generate_overlap_harness(task: Task, candidate_src: str,
     parts.append("  /* Shared buffer: all pointers alias into one array */")
     parts.append(f"  {pointee} shared_o[MAXN * 2];")
     parts.append(f"  {pointee} shared_c[MAXN * 2];")
-    parts.append("  for (int __i = 0; __i < MAXN * 2; __i++) {")
-    parts.append(f"    shared_o[__i] = {nondet_elem};")
-    if narrowed and not any_string:
-        assume = _emit_range_assume("shared_o[__i]", pointee, int(buf_range[0]), int(buf_range[1]))
-        if assume:
-            parts.append(f"    {assume}")
-    parts.append("    shared_c[__i] = shared_o[__i];")
-    parts.append("  }")
+    # Straight-line, not a loop: a MAXN*2-iteration loop exceeds the unwind
+    # bound (MAXN + 2), which made the unwinding assertion fail and every
+    # candidate "fail" the overlap check (Decision 16).
+    for k in range(2 * maxn):
+        parts.append(f"  shared_o[{k}] = {nondet_elem};")
+        if narrowed and not any_string:
+            assume = _emit_range_assume(f"shared_o[{k}]", pointee, int(buf_range[0]), int(buf_range[1]))
+            if assume:
+                parts.append(f"  {assume}")
+        parts.append(f"  shared_c[{k}] = shared_o[{k}];")
 
     # Symbolic offsets for each pointer into the shared buffer
     pointer_names = [name for name, _ in pointer_params]
@@ -930,6 +937,17 @@ def generate_overlap_harness(task: Task, candidate_src: str,
 
     ret_clean = _clean_type_str(sig.return_type)
     ret_void = ret_clean == "void"
+    if single:
+        # Safety-only: call the first function once; CBMC's safety checks are the test.
+        parts.append(f"  orig__{task.func_name}({', '.join(orig_args)});")
+        parts.append("}")
+        return HarnessResult(
+            harness_src="\n".join(parts),
+            original_func_name=f"orig__{task.func_name}",
+            candidate_func_name=f"orig__{task.func_name}",
+            maxn=maxn,
+            unwind=unwind,
+        )
     if not ret_void:
         parts.append(f"  {ret_clean} __r_o = orig__{task.func_name}({', '.join(orig_args)});")
         parts.append(f"  {ret_clean} __r_c = cand__{task.func_name}({', '.join(cand_args)});")
@@ -950,9 +968,8 @@ def generate_overlap_harness(task: Task, candidate_src: str,
         parts.append(f"  cand__{task.func_name}({', '.join(cand_args)});")
 
     # Compare shared buffers
-    parts.append("  for (int __i = 0; __i < MAXN * 2; __i++) {")
-    parts.append("    assert(shared_o[__i] == shared_c[__i]);")
-    parts.append("  }")
+    for k in range(2 * maxn):
+        parts.append(f"  assert(shared_o[{k}] == shared_c[{k}]);")
 
     parts.append("}")
 

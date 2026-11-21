@@ -48,7 +48,7 @@ class EvalResult:
     check_time_s: float = 0.0
     test_result: dict | None = None
     verify_result: dict | None = None
-    overlap_check: str = "not_applicable"  # "passed" | "failed" | "not_applicable" | "skipped_original_ub"
+    overlap_check: str = "not_applicable"  # "passed" | "failed" | "unknown" | "not_applicable" | "skipped_original_ub"
     near_identical: bool = False
     large_input_check: str = "not_run"  # "passed" | "failed" | "error" | "not_applicable" | "not_run"
     checks: dict = field(default_factory=dict)  # per-check verdicts (all of them if short_circuit=False)
@@ -172,7 +172,8 @@ def _run_overlap_check(
 ) -> str:
     """Run the overlapping-buffer CBMC check (R1 spec Step 3 item 5).
 
-    Returns: "not_applicable" | "skipped_original_ub" | "passed" | "failed"
+    Returns: "not_applicable" | "skipped_original_ub" | "passed" | "failed" | "unknown"
+    ("unknown" = timed out and fast-prove did not prove it; never a refutation)
     """
     from .harness import generate_overlap_harness
 
@@ -180,12 +181,12 @@ def _run_overlap_check(
     if cand_harness is None:
         return "not_applicable"
 
-    def _run_src(src: str, flags: list[str] | None) -> subprocess.CompletedProcess | None:
+    def _run_src_t(src: str, flags: list[str] | None, t: float) -> subprocess.CompletedProcess | None:
         with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
             f.write(src)
             path = f.name
         try:
-            return _run_cbmc_raw(path, unwind, timeout_s, extra_flags=flags)
+            return _run_cbmc_raw(path, unwind, t, extra_flags=flags)
         except subprocess.TimeoutExpired:
             return None
         finally:
@@ -197,14 +198,28 @@ def _run_overlap_check(
     # Check whether the original itself has UB under overlap
     orig_harness = generate_overlap_harness(task, task.func_src, maxn=maxn, unwind=unwind)
     if orig_harness is not None:
-        orig_res = _run_src(orig_harness.harness_src, None)
+        orig_res = _run_src_t(orig_harness.harness_src, None, timeout_s)
         if orig_res is not None and _has_safety_failures(orig_res.stdout):
             return "skipped_original_ub"
 
-    cand_res = _run_src(cand_harness.harness_src, extra_cbmc_flags)
+    from .config import get_config
+    ccfg = (_active_config or get_config()).get("cbmc", {})
+    fast = bool(ccfg.get("fast_prove", False))
+    exact_timeout = min(timeout_s, ccfg.get("exact_timeout_s", timeout_s)) if fast else timeout_s
+    cand_res = _run_src_t(cand_harness.harness_src, extra_cbmc_flags, exact_timeout)
     if cand_res is not None and "VERIFICATION SUCCESSFUL" in cand_res.stdout:
         return "passed"
-    return "failed"
+    if cand_res is not None:
+        return "failed"
+    # Timed out: not a refutation. Try the abstraction-based proof, else unknown.
+    if fast:
+        from .verify import fast_prove_check
+        ok, _, _ = fast_prove_check(task, candidate_src, maxn=maxn, unwind=unwind,
+                                    timeout_s=timeout_s, extra_cbmc_flags=extra_cbmc_flags,
+                                    overlap=True)
+        if ok:
+            return "passed"
+    return "unknown"
 
 
 def evaluate(
@@ -212,7 +227,7 @@ def evaluate(
     candidate_src: str,
     *,
     timeout_s: float = 60,
-    maxn: int = 8,
+    maxn: int | None = None,
     skip_tests: bool = False,
     skip_speed: bool = False,
     short_circuit: bool = True,
@@ -241,6 +256,8 @@ def evaluate(
 
     start_time = time.monotonic()
     cfg = _active_config or get_config()
+    if maxn is None:
+        maxn = int(cfg.get("cbmc", {}).get("maxn", 8))
     cache_tag = "" if short_circuit else ":full"
 
     # Check cache
@@ -304,6 +321,9 @@ def evaluate(
         if overlap_check == "failed":
             status = "not_equivalent"
             details = "Failed overlapping-buffer equivalence check"
+        elif overlap_check == "unknown":
+            status = "unknown_timeout"
+            details = "Overlapping-buffer check timed out"
 
     # 5. Large-input random tests (n > MAXN): CBMC's proof stops at the bound.
     large_input_check = "not_run"
@@ -429,7 +449,7 @@ def evaluate_batch(
     tasks_candidates: list[tuple[Task, str]],
     *,
     timeout_s: float = 60,
-    maxn: int = 8,
+    maxn: int | None = None,
     n_workers: int = 1,
     short_circuit: bool = True,
     extra_cbmc_flags: list[str] | None = None,
