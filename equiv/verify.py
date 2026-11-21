@@ -49,6 +49,29 @@ EXIT_ERROR = 6     # parsing/compilation error
 EXIT_SIGNAL = -1   # killed by signal (timeout)
 
 
+def run_cbmc_process(cmd: list[str], timeout_s: float) -> subprocess.CompletedProcess:
+    """Run CBMC in its own session; on timeout, kill the WHOLE process group.
+
+    subprocess.run(timeout=...) kills only the direct child. CBMC started with
+    an external solver (--z3, --smt2, --bitwuzla) spawns it as a child, which
+    would survive the timeout and keep burning CPU. Raises TimeoutExpired, like
+    subprocess.run.
+    """
+    import signal
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        proc.communicate()
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 def verify(
     task: Task,
     candidate_src: str,
@@ -148,14 +171,7 @@ def _run_cbmc(
     start_time = time.monotonic()
 
     try:
-        proc = subprocess.run(
-            flags,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            # Start in new process group for clean kill on timeout
-            preexec_fn=os.setsid if hasattr(os, "setsid") else None,
-        )
+        proc = run_cbmc_process(flags, timeout_s)
     except subprocess.TimeoutExpired:
         check_time = time.monotonic() - start_time
         return VerifyResult(
@@ -304,12 +320,7 @@ def _get_counterexample(
     flags.append(harness_path)
 
     try:
-        proc = subprocess.run(
-            flags,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-        )
+        proc = run_cbmc_process(flags, timeout_s)
     except subprocess.TimeoutExpired:
         return {"error": "Timeout during counterexample extraction"}
 
@@ -587,7 +598,7 @@ def _run_cbmc_raw(
         flags.extend(extra_flags)
     flags.append(harness_path)
 
-    return subprocess.run(flags, capture_output=True, text=True, timeout=timeout_s)
+    return run_cbmc_process(flags, timeout_s)
 
 
 def _has_safety_failures(stdout: str) -> bool:
