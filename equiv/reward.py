@@ -34,6 +34,8 @@ EvalStatus = Literal[
     "compile_error",
     "checker_error",
     "test_fail",
+    "bound_overfit",        # proven up to MAXN, wrong on a larger input
+    "unknown_large_input",  # proven up to MAXN, no large-input check could run
 ]
 
 
@@ -48,6 +50,8 @@ class EvalResult:
     verify_result: dict | None = None
     overlap_check: str = "not_applicable"  # "passed" | "failed" | "not_applicable" | "skipped_original_ub"
     near_identical: bool = False
+    large_input_check: str = "not_run"  # "passed" | "failed" | "error" | "not_applicable" | "not_run"
+    checks: dict = field(default_factory=dict)  # per-check verdicts (all of them if short_circuit=False)
     details: str = ""
 
 
@@ -211,13 +215,20 @@ def evaluate(
     maxn: int = 8,
     skip_tests: bool = False,
     skip_speed: bool = False,
+    short_circuit: bool = True,
     extra_cbmc_flags: list[str] | None = None,
     _allow_overflow_off: bool = False,  # internal: only for self-equiv
 ) -> EvalResult:
     """Evaluate a candidate against the original function.
 
     Pipeline: cache → cheap tests → CBMC verify → overlap check →
-              near_identical check → speed proxy (+ large-input checksum).
+              large-input tests → near_identical check → speed proxy
+              (+ large-input checksum).
+
+    short_circuit=False (Stage 0.5 analysis mode) runs every check on every
+    candidate, including a heavy in-domain random test, and records each verdict
+    in `checks`. The final `status` is the same as in short-circuit mode, so
+    reward() is unaffected; only the extra evidence differs.
     """
     # Enforce: candidate checks MUST run with signed-overflow-check ON.
     # --no-signed-overflow-check is only allowed for self-equivalence.
@@ -229,52 +240,55 @@ def evaluate(
             )
 
     start_time = time.monotonic()
+    cfg = _active_config or get_config()
+    cache_tag = "" if short_circuit else ":full"
 
     # Check cache
     if _cache and _config_hash:
-        cached = _cache.get(task.task_id, candidate_src, _config_hash)
+        cached = _cache.get(task.task_id, candidate_src, _config_hash + cache_tag)
         if cached:
             return EvalResult(**cached)
 
     # 1. Normalize candidate
     candidate_src = candidate_src.strip()
     eff_unwind = task.unwind or (maxn + 2)
+    checks: dict[str, str] = {}
 
-    # 2. Cheap test pre-filter
+    def _finish(result: EvalResult) -> EvalResult:
+        result.checks = checks
+        result.check_time_s = time.monotonic() - start_time
+        _cache_put(task.task_id, candidate_src, result, cache_tag)
+        return result
+
+    # 2. Cheap test pre-filter (+ heavy in-domain tests in analysis mode)
+    test_result = None
     if not skip_tests:
         from .testgen import run_tests
         test_result = run_tests(task, candidate_src, maxn=maxn)
-        if not test_result.passed:
-            result = EvalResult(
+        checks["cheap_tests"] = "pass" if test_result.passed else "fail"
+        if not short_circuit:
+            n_heavy = cfg.get("tests", {}).get("n_heavy", 2000)
+            heavy = run_tests(task, candidate_src, maxn=maxn, n_random=n_heavy,
+                              include_edges=False, seed=1)
+            checks["heavy_tests"] = "pass" if heavy.passed else "fail"
+        if not test_result.passed and short_circuit:
+            return _finish(EvalResult(
                 status="test_fail",
                 task_id=task.task_id,
-                check_time_s=test_result.time_s,
                 test_result={"first_failure": test_result.first_failure,
                              "details": test_result.details},
                 details=f"Failed cheap tests: {test_result.details[:200]}",
-            )
-            _cache_put(task.task_id, candidate_src, result)
-            return result
-    else:
-        test_result = None
+            ))
 
     # 3. CBMC main verify (using task.unwind)
     verify_result = verify(
         task, candidate_src, timeout_s=timeout_s, maxn=maxn,
         unwind=eff_unwind, extra_cbmc_flags=extra_cbmc_flags,
     )
-
-    status_map = {
-        "proven": "proven",
-        "not_equivalent": "not_equivalent",
-        "unknown_timeout": "unknown_timeout",
-        "unknown_unwind": "unknown_unwind",
-        "unsupported": "unsupported",
-        "compile_error": "compile_error",
-        "checker_error": "checker_error",
-    }
-
-    status = status_map.get(verify_result.status, "checker_error")
+    known = {"proven", "not_equivalent", "unknown_timeout", "unknown_unwind",
+             "unsupported", "compile_error", "checker_error"}
+    status = verify_result.status if verify_result.status in known else "checker_error"
+    checks["cbmc_main"] = status
     details = verify_result.details
     overlap_check = "not_applicable"
     near_identical = False
@@ -286,34 +300,67 @@ def evaluate(
             task, candidate_src, maxn=maxn, unwind=eff_unwind,
             timeout_s=timeout_s, extra_cbmc_flags=extra_cbmc_flags,
         )
+        checks["cbmc_overlap"] = overlap_check
         if overlap_check == "failed":
             status = "not_equivalent"
             details = "Failed overlapping-buffer equivalence check"
 
-    # 5. Near-identical check + speed proxy (+ large-input differential checksum)
+    # 5. Large-input random tests (n > MAXN): CBMC's proof stops at the bound.
+    large_input_check = "not_run"
+    if status == "proven" or (not short_circuit and status != "compile_error"):
+        from .testgen import run_large_tests
+        lcfg = cfg.get("large_tests", {})
+        lr = run_large_tests(
+            task, candidate_src, maxn=maxn,
+            bench_n=lcfg.get("bench_n", 512), n_random=lcfg.get("n_random", 64),
+            seed=lcfg.get("seed", 0),
+        )
+        large_input_check = lr.verdict
+        checks["large_tests"] = lr.verdict
+        if status == "proven" and lr.verdict == "failed":
+            status = "bound_overfit"
+            details = f"Large-input random test mismatch (n > MAXN): {lr.details[:200]}"
+
+    # 6. Near-identical check + speed proxy (+ fixed large-input checksum)
+    checksum_ok = False
     if status == "proven":
         near_identical = check_near_identical(task, candidate_src)
         if not near_identical and not skip_speed:
             from .speed import have_valgrind, measure_speedup
 
-            cfg_proxy = (_active_config or get_config()).get("speed", {}).get("proxy", "inproc_time")
+            cfg_proxy = cfg.get("speed", {}).get("proxy", "inproc_time")
             proxy = "callgrind" if (cfg_proxy == "callgrind" and have_valgrind()) else "inproc_time"
             sr = measure_speedup(task, candidate_src, proxy=proxy)
-            if sr.error is None:
-                if not sr.outputs_match:
-                    status = "not_equivalent"
-                    details = "Large-input checksum mismatch (possible bound-overfitting for n > MAXN)"
-                    speedup = 1.0
-                else:
-                    speedup = sr.speedup
+            if sr.error is not None or sr.proxy == "static_asm":
+                checks["checksum"] = "not_run"
+            elif not sr.outputs_match:
+                checks["checksum"] = "mismatch"
+                status = "bound_overfit"
+                details = "Large-input checksum mismatch (BENCH_N input differs; n > MAXN)"
+            else:
+                checks["checksum"] = "match"
+                checksum_ok = True
+                speedup = sr.speedup
 
-    check_time = time.monotonic() - start_time
+    # 7. A non-trivial proof must be backed by at least one passing large-input
+    #    check; otherwise the n > MAXN behavior is unchecked (Stage 0.5 P3).
+    if (status == "proven" and not near_identical
+            and large_input_check not in ("passed", "not_applicable")
+            and not checksum_ok):
+        status = "unknown_large_input"
+        details = (f"Proven up to MAXN, but no large-input check succeeded "
+                   f"(large_tests={large_input_check}, checksum={checks.get('checksum', 'not_run')})")
+        speedup = 1.0
 
-    result = EvalResult(
+    # Analysis mode: same final status precedence as short-circuit mode.
+    if test_result is not None and not test_result.passed:
+        status = "test_fail"
+        details = f"Failed cheap tests: {test_result.details[:200]}"
+
+    return _finish(EvalResult(
         status=status,
         task_id=task.task_id,
         speedup=speedup,
-        check_time_s=check_time,
         test_result={"passed": test_result.passed, "n_tests": test_result.n_tests}
         if test_result else None,
         verify_result={
@@ -323,12 +370,10 @@ def evaluate(
             "details": verify_result.details,
         },
         overlap_check=overlap_check,
+        large_input_check=large_input_check,
         near_identical=near_identical,
         details=details,
-    )
-
-    _cache_put(task.task_id, candidate_src, result)
-    return result
+    ))
 
 
 def reward(
@@ -359,11 +404,11 @@ def reward(
     return min(r.speedup, cap) - 1.0
 
 
-def _cache_put(task_id: str, candidate_src: str, result: EvalResult):
+def _cache_put(task_id: str, candidate_src: str, result: EvalResult, tag: str = ""):
     """Cache the evaluation result if cache is configured."""
     if _cache and _config_hash:
         try:
-            _cache.put(task_id, candidate_src, _config_hash, {
+            _cache.put(task_id, candidate_src, _config_hash + tag, {
                 "status": result.status,
                 "task_id": result.task_id,
                 "speedup": result.speedup,
@@ -371,6 +416,8 @@ def _cache_put(task_id: str, candidate_src: str, result: EvalResult):
                 "test_result": result.test_result,
                 "verify_result": result.verify_result,
                 "overlap_check": result.overlap_check,
+                "large_input_check": result.large_input_check,
+                "checks": result.checks,
                 "near_identical": result.near_identical,
                 "details": result.details,
             })
@@ -384,6 +431,7 @@ def evaluate_batch(
     timeout_s: float = 60,
     maxn: int = 8,
     n_workers: int = 1,
+    short_circuit: bool = True,
     extra_cbmc_flags: list[str] | None = None,
 ) -> list[EvalResult]:
     """Evaluate multiple (task, candidate) pairs.
@@ -395,7 +443,8 @@ def evaluate_batch(
         for task, candidate_src in tasks_candidates:
             try:
                 r = evaluate(task, candidate_src, timeout_s=timeout_s,
-                             maxn=maxn, extra_cbmc_flags=extra_cbmc_flags)
+                             maxn=maxn, short_circuit=short_circuit,
+                             extra_cbmc_flags=extra_cbmc_flags)
             except Exception as e:
                 r = EvalResult(
                     status="checker_error", task_id=task.task_id,
@@ -412,7 +461,7 @@ def evaluate_batch(
         for i, (task, cand) in enumerate(tasks_candidates):
             future = executor.submit(
                 evaluate, task, cand,
-                timeout_s=timeout_s, maxn=maxn,
+                timeout_s=timeout_s, maxn=maxn, short_circuit=short_circuit,
                 extra_cbmc_flags=extra_cbmc_flags,
             )
             future_to_idx[future] = i
@@ -422,9 +471,8 @@ def evaluate_batch(
             try:
                 results[idx] = future.result()
             except Exception as e:
-                # We don't have the task_id here — use empty string
                 results[idx] = EvalResult(
-                    status="checker_error", task_id="",
+                    status="checker_error", task_id=tasks_candidates[idx][0].task_id,
                     details=str(e),
                 )
 

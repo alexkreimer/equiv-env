@@ -147,7 +147,44 @@ def run_single_mutant(args) -> MutantResult:
         r.ground_truth = heavy_random_test(task, task.func_src, mutant_src)
     except Exception:
         r.ground_truth = "unknown"
+    try:
+        from equiv.testgen import run_tests
+        tr = run_tests(task, mutant_src, maxn=task.maxn or 8, seed=r.mutant_idx)
+        r.test_verdict = "pass" if tr.passed else "fail"
+    except Exception:
+        r.test_verdict = "error"
     return r
+
+
+def escape_rates(results) -> dict:
+    """Which checks catch what CBMC refutes (Stage 0.5 P1).
+
+    refuted   = CBMC says not_equivalent; confirmed = and the counterexample replays.
+    cheap_escape: refuted, but the cheap tests (the evaluate() pre-filter) pass.
+    heavy_escape: refuted, but heavy in-domain random testing finds no difference.
+    """
+    def _block(rs):
+        n = len(rs)
+        cheap = sum(1 for r in rs if r.test_verdict == "pass")
+        heavy = sum(1 for r in rs if r.ground_truth == "same")
+        both = sum(1 for r in rs if r.test_verdict == "pass" and r.ground_truth == "same")
+        pct = lambda k: round(100.0 * k / n, 2) if n else 0.0
+        return {"n": n, "cheap_escape": cheap, "cheap_escape_pct": pct(cheap),
+                "heavy_escape": heavy, "heavy_escape_pct": pct(heavy),
+                "both_escape": both, "both_escape_pct": pct(both)}
+
+    refuted = [r for r in results if r.cbmc_verdict == "not_equivalent"]
+    confirmed = [r for r in refuted if r.counterexample_replay == "replayed"]
+    passed_cheap = [r for r in results if r.test_verdict == "pass"]
+    refuted_given_cheap = sum(1 for r in passed_cheap if r.cbmc_verdict == "not_equivalent")
+    return {
+        "refuted": _block(refuted),
+        "confirmed_refuted": _block(confirmed),
+        "test_verdicts": dict(Counter(r.test_verdict for r in results)),
+        # P(CBMC refutes | passes cheap tests): the mutation analogue of H_cheap
+        "h_cheap_pct": round(100.0 * refuted_given_cheap / len(passed_cheap), 2) if passed_cheap else 0.0,
+        "n_passed_cheap": len(passed_cheap),
+    }
 
 
 def run_mutation_study(
@@ -239,6 +276,12 @@ def run_mutation_study(
     print(f"CE replay: {by_status['replayed']}/{len(ce_results)} replayed "
           f"({by_status['not_reproduced']} not_reproduced = possible checker bugs, "
           f"{by_status['driver_error']} driver_error = replay tooling problems)")
+    esc = escape_rates(results)
+    for label in ("refuted", "confirmed_refuted"):
+        b = esc[label]
+        print(f"Escapes among {label} ({b['n']}): cheap tests {b['cheap_escape']} ({b['cheap_escape_pct']}%), "
+              f"heavy random {b['heavy_escape']} ({b['heavy_escape_pct']}%), both {b['both_escape']} ({b['both_escape_pct']}%)")
+    print(f"P(CBMC refutes | passes cheap tests): {esc['h_cheap_pct']}% of {esc['n_passed_cheap']}")
     print(f"Time: {elapsed:.1f}s")
 
     if json_out:
@@ -257,6 +300,7 @@ def run_mutation_study(
             "ce_not_reproduced": by_status["not_reproduced"],
             "ce_driver_error": by_status["driver_error"],
             "elapsed_s": round(elapsed, 2),
+            "escapes": esc,
         }
         with open(json_out, "w") as out:
             _json.dump(summary, out, indent=2)

@@ -37,6 +37,12 @@ dataset:
 
 tests:
   n_random: 200
+  n_heavy: 2000       # in-domain random tests, evaluate(short_circuit=False) only
+
+large_tests:          # differential tests with lengths in (MAXN, bench_n]
+  n_random: 64
+  bench_n: 512
+  seed: 0
 
 speed:
   proxy: callgrind

@@ -49,6 +49,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "tests": {
         "n_random": 200,
+        "n_heavy": 2000,   # in-domain random tests, analysis mode only
+    },
+    "large_tests": {       # n > MAXN differential tests (Stage 0.5 P4)
+        "n_random": 64,
+        "bench_n": 512,
+        "seed": 0,
     },
     "speed": {
         "proxy": "callgrind",

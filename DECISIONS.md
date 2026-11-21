@@ -146,3 +146,17 @@ All 32 golden tests pass (28 parametric + 4 static + 2 memset-specific).
 - Excluded compiler testsuites (`gcc/testsuite`, `llvm/test`, `clang/test`) and synthetic obfuscator benchmarks (`tigress`, `obfuscated-programs`, `csmith`) in `extract.py` with explicit reason code `excluded_source`.
 - Added per-file (`max_per_file: 10`) and per-repo (`max_per_repo: 200`) caps in `scripts/build_dataset.py` (logged as `cap_exceeded_file` / `cap_exceeded_repo`).
 - Wired `reward.py` (`init` and `reward` defaults) to `config.yaml` and canonical `config_hash()`.
+
+## Decision 15 — Stage 0.5 pre-work: large-input gate, new statuses, analysis mode (2026-11-21)
+
+**Why:** CBMC proves equivalence only for lengths ≤ MAXN. The only n > MAXN guard was the fixed BENCH_N = 512 speed checksum: one input; skipped silently when the speed step errors; its mismatch was reported as `not_equivalent`, the same status as a CBMC refutation. The mutation study never filled `test_verdict`, so the test-only escape rate (spec §7.2) was never reported.
+
+**Decision:**
+- **P1:** `run_mutation_study.py` fills `test_verdict` with the same cheap tests `evaluate()` uses and reports escape rates (cheap tests / heavy random / both, over refuted and over replay-confirmed mutants) plus P(CBMC refutes | passes cheap tests). Written to `--json-out` under `escapes`.
+- **P2:** new status `bound_overfit` for proven-up-to-MAXN candidates that differ on a larger input (large random tests or BENCH_N checksum).
+- **P3:** new status `unknown_large_input`: a non-near-identical proof must be backed by at least one *passing* large-input check (large random tests or checksum). Spec draft said "speed error → unknown"; implemented as "no large check succeeded" so a speed-proxy failure alone does not discard a proof the large tests already backed.
+- **P4:** `testgen.run_large_tests()`: 64 seeded random inputs, paired/string lengths in (MAXN, 512], values from `input_ranges`. Inputs where the original has UB or crashes are dropped first: original-only driver, one forked child per input, `-fsanitize=undefined -fno-sanitize-recover` (one process per input because UBSan reports each source location once per process). The differential driver uses `-fwrapv`. Since original-UB/crash inputs are removed, a candidate mismatch, crash or timeout is `failed`. The UB filter is memoized per task. Cost ≈ 1–2 s per call on the dev Mac (two -O0 compiles); revisit before RL if it dominates throughput.
+- **P5:** `evaluate(..., short_circuit=False)` runs every check (adds 2,000 seeded in-domain random tests) and records verdicts in `EvalResult.checks`; final `status` matches short-circuit mode, so `reward()` is unchanged. Cached under a separate key.
+- Test driver now initializes buffers with initializer lists + `memcpy` (was one statement per element), needed for 512-element buffers.
+- Config: `tests.n_heavy`, `large_tests.{n_random, bench_n, seed}`. This changes `config_hash`, so cached results from before this change are not reused.
+- **Observed during testing:** CBMC (MAXN = 8, unwind 10, 60 s) proves `sum_arr` against a same-order rewrite in ~1 s but times out on correct *reordered* sums (reversed loop; two accumulators). Reassociated 32-bit adds are hard for SAT. Tests use a same-order rewrite. Stage 0.5 reports how much speedup sits in such "probably correct, unprovable" timeouts.
