@@ -3,9 +3,11 @@
 
 cbmc:
   arch: x86_64
-  maxn: 8
+  maxn: 4              # proof bound for candidates (was 8); n > maxn covered by large_tests
   unwind_candidates: [10, 34, 66]
   timeout_s: 60
+  fast_prove: true     # on exact-check timeout: abstract var*var as UF + candidate safety run
+  exact_timeout_s: 20  # exact-check budget when fast_prove is on
   ub_timeout_s: 30
   memory_limit_gb: 8
 

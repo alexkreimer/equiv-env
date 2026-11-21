@@ -160,3 +160,18 @@ All 32 golden tests pass (28 parametric + 4 static + 2 memset-specific).
 - Test driver now initializes buffers with initializer lists + `memcpy` (was one statement per element), needed for 512-element buffers.
 - Config: `tests.n_heavy`, `large_tests.{n_random, bench_n, seed}`. This changes `config_hash`, so cached results from before this change are not reused.
 - **Observed during testing:** CBMC (MAXN = 8, unwind 10, 60 s) proves `sum_arr` against a same-order rewrite in ~1 s but times out on correct *reordered* sums (reversed loop; two accumulators). Reassociated 32-bit adds are hard for SAT. Tests use a same-order rewrite. Stage 0.5 reports how much speedup sits in such "probably correct, unprovable" timeouts.
+
+## Decision 16 — Fast-prove (abstracted multiplication), proof bound MAXN 4, overlap-harness fix (2026-11-21)
+
+**Why:** CBMC bit-blasts arithmetic; a SAT solver does not know `+`/`*` are associative/commutative. Correct rewrites that reorder a reduction (reversed loop, k accumulators — how unrolling and vectorization gain speed) and any loop multiplying two variables timed out at 60 s, even at 300 s (`scripts/probe_reorder.py`, `data/stage05/`). The Stage 0 self-check (original vs identical copy) never exposed this: identical circuits are merged structurally.
+
+**Decision:**
+- **Proof bound `cbmc.maxn` 8 → 4.** Reordered sums prove in ~1 s at 4 and time out at 6–8. Lengths 5..512 are covered by the large-input random tests (Decision 15). The claim becomes "proven for n ≤ 4, tested above". `build_dataset.py` also reads this value; the existing task files were built at 8 and are unaffected (a smaller harness domain is a subset).
+- **Fast-prove** (`equiv/abstraction.py`, `verify.fast_prove_check`), used when the exact check times out (`cbmc.exact_timeout_s` = 20 s, then up to `timeout_s` per run):
+  1. Every `x*y` with two non-constant operands, and `v *= e` on a plain variable, becomes `MUL_T(min, max)` of an uninterpreted function (commutative by construction) in both functions; CBMC runs with `--no-signed-overflow-check` (wrap-around).
+  2. The candidate alone runs with real arithmetic and all safety checks (`generate_ub_harness`, same input domain).
+  Both succeed → `proven`. Sound: the original is UB-free on the domain (dataset filter), run 2 shows the candidate is, so C semantics equal the wrap-around semantics compared in run 1, and an equality that holds for every interpretation of MUL holds for real multiplication. A fast-prove failure is never reported as a counterexample. Incomplete: distributivity, or re-associating products, does not prove.
+- **Overlap check:** a timeout now returns `unknown` (→ `unknown_timeout`), not `failed` (→ `not_equivalent`), and uses the overlap variant of fast-prove first.
+- **Bug fix — overlap harness:** its shared-buffer init/compare loops ran `MAXN*2` iterations, above the unwind bound `MAXN+2`, so the unwinding assertion failed and **every** candidate for a task with ≥ 2 same-type, non-`restrict` pointers was rejected as `not_equivalent` — 869 of 5,500 train tasks (466 of 1,581 loop tasks). The loops are now unrolled in the generated C. Regression tests: `tests/test_fast_prove.py`.
+
+**Probe result** (6 kernels × 4 correct rewrites): proven 10/24 at MAXN 8 before → 24/24 at MAXN 4 with fast-prove. Multiplication cases take 22–64 s (20 s of it the exact check timing out first). Reordered dot product on the *overlap* harness takes ~60 s: likely `unknown` at the current budget.

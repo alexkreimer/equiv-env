@@ -80,6 +80,7 @@ def verify(
     maxn: int = 8,
     unwind: int | None = None,
     extra_cbmc_flags: list[str] | None = None,
+    fast_prove: bool | None = None,
 ) -> VerifyResult:
     """Verify equivalence between original and candidate using CBMC.
 
@@ -90,12 +91,21 @@ def verify(
         maxn: Maximum buffer size.
         unwind: Loop unwind bound (default: maxn + 2).
         extra_cbmc_flags: Additional CBMC flags (e.g. ["--no-signed-overflow-check"]).
+        fast_prove: If the exact check times out, try the abstraction-based
+            fast-prove (equiv/abstraction.py). None = config `cbmc.fast_prove`.
+            With it on, the exact check gets `cbmc.exact_timeout_s` and each
+            fast-prove run gets `timeout_s`.
 
     Returns:
         VerifyResult with status and optional counterexample.
     """
     if unwind is None:
         unwind = maxn + 2
+    from .config import get_config
+    ccfg = get_config().get("cbmc", {})
+    if fast_prove is None:
+        fast_prove = bool(ccfg.get("fast_prove", False))
+    exact_timeout = min(timeout_s, ccfg.get("exact_timeout_s", timeout_s)) if fast_prove else timeout_s
 
     # Generate harness
     harness_result = generate_harness(task, candidate_src, maxn=maxn, unwind=unwind)
@@ -113,7 +123,7 @@ def verify(
             harness_path,
             task,
             harness_result,
-            timeout_s=timeout_s,
+            timeout_s=exact_timeout,
             unwind=unwind,
             extra_cbmc_flags=extra_cbmc_flags,
         )
@@ -123,7 +133,100 @@ def verify(
         except OSError:
             pass
 
+    if result.status == "unknown_timeout" and fast_prove:
+        fp_ok, fp_detail, fp_time = fast_prove_check(
+            task, candidate_src, maxn=maxn, unwind=unwind, timeout_s=timeout_s,
+            extra_cbmc_flags=extra_cbmc_flags,
+        )
+        if fp_ok:
+            return VerifyResult(
+                status="proven", check_time_s=result.check_time_s + fp_time,
+                details=f"fast-prove: {fp_detail}",
+            )
+        result.check_time_s += fp_time
+        result.details = f"{result.details}; fast-prove failed: {fp_detail}"
+
     return result
+
+
+def _cbmc_success(src: str, unwind: int, timeout_s: float, flags: list[str] | None) -> tuple[bool | None, str]:
+    """Run CBMC on a harness source. True = all properties hold, False = some fail, None = timeout/error."""
+    with tempfile.NamedTemporaryFile(suffix=".c", mode="w", prefix="fast_", delete=False) as f:
+        f.write(src)
+        path = f.name
+    try:
+        proc = _run_cbmc_raw(path, unwind, timeout_s, extra_flags=flags)
+    except subprocess.TimeoutExpired:
+        return None, "timeout"
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if proc.returncode == EXIT_ERROR or "PARSING ERROR" in proc.stderr or "CONVERSION ERROR" in proc.stderr:
+        return None, "cbmc error: " + (proc.stderr or proc.stdout)[:200]
+    if "VERIFICATION SUCCESSFUL" in proc.stdout:
+        return True, "ok"
+    return False, "properties fail"
+
+
+def fast_prove_check(
+    task: Task,
+    candidate_src: str,
+    *,
+    maxn: int,
+    unwind: int,
+    timeout_s: float,
+    extra_cbmc_flags: list[str] | None = None,
+    overlap: bool = False,
+) -> tuple[bool, str, float]:
+    """Abstraction-based proof (see equiv/abstraction.py): (proven?, detail, seconds).
+
+    Run 1: equivalence with var*var multiplications as a commutative uninterpreted
+    function, signed arithmetic wrapping (--no-signed-overflow-check).
+    Run 2: the candidate alone with real arithmetic and all safety checks.
+    `overlap=True` does the same for the overlapping-buffer harness.
+    A failure here is never a counterexample, only "not proven".
+    """
+    from dataclasses import replace as _replace
+    from .abstraction import abstract_mul, inject_helpers
+    from .harness import _extract_function_name, generate_overlap_harness, generate_ub_harness
+
+    start = time.monotonic()
+    elapsed = lambda: time.monotonic() - start
+    orig_abs = abstract_mul(task, task.func_src)
+    cand_abs = abstract_mul(task, candidate_src)
+    if orig_abs is None or cand_abs is None:
+        return False, "abstraction not applicable", elapsed()
+    types = orig_abs[1] | cand_abs[1]
+    abs_task = _replace(task, func_src=orig_abs[0])
+
+    if overlap:
+        h = generate_overlap_harness(abs_task, cand_abs[0], maxn=maxn, unwind=unwind)
+    else:
+        h = generate_harness(abs_task, cand_abs[0], maxn=maxn, unwind=unwind)
+    if h is None:
+        return False, "no harness", elapsed()
+    flags = list(extra_cbmc_flags or [])
+    if "--no-signed-overflow-check" not in flags:
+        flags.append("--no-signed-overflow-check")
+    ok, why = _cbmc_success(inject_helpers(h.harness_src, types), unwind, timeout_s, flags)
+    if not ok:
+        return False, f"abstract equivalence {why}", elapsed()
+
+    # Run 2: candidate safety with real arithmetic, same input domain.
+    cand_name = _extract_function_name(candidate_src) or task.func_name
+    cand_task = _replace(task, func_src=candidate_src, func_name=cand_name)
+    if overlap:
+        sh = generate_overlap_harness(cand_task, candidate_src, maxn=maxn, unwind=unwind, single=True)
+    else:
+        sh = generate_ub_harness(cand_task, maxn=maxn, unwind=unwind)
+    if sh is None:
+        return False, "no safety harness", elapsed()
+    ok, why = _cbmc_success(sh.harness_src, unwind, timeout_s, extra_cbmc_flags)
+    if not ok:
+        return False, f"candidate safety {why}", elapsed()
+    return True, f"abstract equivalence + candidate safety ({', '.join(sorted(types)) or 'no *'} abstracted)", elapsed()
 
 
 def self_verify(
