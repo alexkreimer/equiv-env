@@ -55,14 +55,23 @@ def _compile_and_run(driver_src: str, timeout_s: int = 30) -> str:
 
 
 def heavy_random_test(task, original_src: str, mutant_src: str, n_inputs: int = 1000) -> str:
-    """Heavy random testing to determine ground truth. Uses 1000 inputs (not 100k for speed)."""
+    """Heavy random testing to determine ground truth within the harness's input domain."""
     from equiv.extract import get_paired_length_params
-    from equiv.harness import _header_for_task, _pointee_type, _clean_type_str
+    from equiv.harness import _header_for_task, _pointee_type, _clean_type_str, _type_bounds
     from equiv.replay import _strip_inline
 
     sig = task.signature
     pointer_rules = task.pointer_rules or {}
     paired_lengths = get_paired_length_params(sig, pointer_rules)
+    input_ranges = task.input_ranges or {}
+    narrowed = bool(input_ranges.get("_narrowed"))
+    buf_range = input_ranges.get("_buf_range", (-32768, 32767))
+
+    def _rand_in_range(c_type: str, lo: int, hi: int) -> str:
+        tmin, tmax, _ = _type_bounds(c_type)
+        clo, chi = max(lo, tmin), min(hi, tmax)
+        span = max(1, chi - clo + 1)
+        return f"({_clean_type_str(c_type)})({clo}LL + (long long)((unsigned long long)rand() % {span}ULL))"
 
     orig = _strip_inline(_rename_function(original_src, task.func_name, "orig_func") or original_src)
     mut = _strip_inline(_rename_function(mutant_src, task.func_name, "mut_func") or mutant_src)
@@ -82,13 +91,29 @@ def heavy_random_test(task, original_src: str, mutant_src: str, n_inputs: int = 
                 if c_type.strip().endswith("*"):
                     p = _pointee_type(c_type)
                     parts.append(f"    {p} {name}_o[MAXN], {name}_m[MAXN];")
-                    parts.append(f"    for (int __i = 0; __i < MAXN; __i++) {{ int __v = rand(); {name}_o[__i] = ({p})__v; {name}_m[__i] = ({p})__v; }}")
+                    if narrowed and pointer_rules.get(name) != "string":
+                        val_expr = _rand_in_range(p, int(buf_range[0]), int(buf_range[1]))
+                    else:
+                        val_expr = f"({p})rand()"
+                    parts.append(f"    for (int __i = 0; __i < MAXN; __i++) {{ {p} __v = {val_expr}; {name}_o[__i] = __v; {name}_m[__i] = __v; }}")
                     if pointer_rules.get(name) == "string":
                         parts.append(f"    int __z_{name} = rand() % MAXN; {name}_o[__z_{name}] = 0; {name}_m[__z_{name}] = 0;")
                 elif name in paired_lengths:
                     parts.append(f"    {_clean_type_str(c_type)} {name} = ({_clean_type_str(c_type)})(rand() % (MAXN + 1));")
+                elif name in input_ranges and isinstance(input_ranges[name], (list, tuple)) and len(input_ranges[name]) == 2:
+                    expr = _rand_in_range(c_type, int(input_ranges[name][0]), int(input_ranges[name][1]))
+                    parts.append(f"    {_clean_type_str(c_type)} {name} = {expr};")
+                elif narrowed:
+                    expr = _rand_in_range(c_type, -32768, 32767)
+                    parts.append(f"    {_clean_type_str(c_type)} {name} = {expr};")
                 else:
-                    parts.append(f"    {_clean_type_str(c_type)} {name} = ({_clean_type_str(c_type)})rand();")
+                    decl = _clean_type_str(c_type)
+                    _, _, is_unsigned = _type_bounds(decl)
+                    if not is_unsigned and decl in ("int", "signed", "signed int", "long", "long long", "int32_t", "int64_t", "ssize_t"):
+                        expr = _rand_in_range(c_type, -1073741823, 1073741823)
+                    else:
+                        expr = f"({decl})rand()"
+                    parts.append(f"    {decl} {name} = {expr};")
             oa = [f"{n}_o" if t.strip().endswith("*") else n for n, t in sig.params]
             ma = [f"{n}_m" if t.strip().endswith("*") else n for n, t in sig.params]
             ret = _clean_type_str(sig.return_type)
@@ -125,19 +150,36 @@ def run_single_mutant(args) -> MutantResult:
     return r
 
 
-def run_mutation_study(n_tasks=500, mutants_per_task=3, n_workers=1, data_dir=None, tasks_jsonl=None):
+def run_mutation_study(
+    n_tasks=500,
+    mutants_per_task=3,
+    n_workers=1,
+    data_dir=None,
+    tasks_jsonl=None,
+    loops_only=False,
+    seed=None,
+    json_out=None,
+):
+    if seed is not None:
+        import random
+        random.seed(seed)
+
     if tasks_jsonl:
         import json as _json
         tasks = []
         with open(tasks_jsonl) as f:
             for line in f:
+                if not line.strip():
+                    continue
                 d = _json.loads(line)
+                if loops_only and d.get("n_loops", 0) <= 0:
+                    continue
                 sig_d = d["signature"]
                 sig = Signature(name=sig_d["name"], return_type=sig_d["return_type"], params=[tuple(p) for p in sig_d["params"]])
                 task = Task(
                     task_id=d["task_id"], source=d.get("source", "exebench"), split=d.get("split", "train"),
                     func_name=d["func_name"], func_src=d["func_src"], deps_src=d.get("deps_src", ""),
-                    signature=sig, pointer_rules=d.get("pointer_rules", []),
+                    signature=sig, pointer_rules=d.get("pointer_rules") or {},
                     maxn=d.get("maxn", 8), unwind=d.get("unwind", 10),
                     n_loops=d.get("n_loops", 0), loc=d.get("loc", 0),
                     io_tests=d.get("io_tests"), input_ranges=d.get("input_ranges"),
@@ -153,11 +195,15 @@ def run_mutation_study(n_tasks=500, mutants_per_task=3, n_workers=1, data_dir=No
         tasks = []
         for zst_path in zst_files:
             for result in extract_from_exebench(zst_path, "test"):
-                if result.eligible: tasks.append(result.task)
+                if result.eligible:
+                    if loops_only and result.task.n_loops <= 0:
+                        continue
+                    tasks.append(result.task)
                 if len(tasks) >= n_tasks: break
             if len(tasks) >= n_tasks: break
 
-    print(f"Running mutation study on {len(tasks)} tasks, {mutants_per_task} mutants each...")
+    mode_str = " (loops-only)" if loops_only else ""
+    print(f"Running mutation study on {len(tasks)} tasks{mode_str}, {mutants_per_task} mutants each...")
     all_mutants = []
     for task in tasks:
         for mi, mutant in enumerate(mutate(task.func_src, n=mutants_per_task)):
@@ -181,19 +227,39 @@ def run_mutation_study(n_tasks=500, mutants_per_task=3, n_workers=1, data_dir=No
     ce_results = [r for r in results if r.counterexample_replay != "not_applicable"]
 
     kill_rate = (sum(1 for r in truly_different if r.cbmc_verdict == "not_equivalent") / len(truly_different) * 100) if truly_different else 0
+    by_status = Counter(r.counterexample_replay for r in ce_results)
 
-    print(f"\n{'='*60}\nMUTATION STUDY RESULTS\n{'='*60}")
+    print(f"\n{'='*60}\nMUTATION STUDY RESULTS{mode_str.upper()}\n{'='*60}")
     print(f"Tasks: {len(tasks)}  Mutants: {len(results)}")
     print(f"Truly different: {len(truly_different)}  Truly same: {len(truly_same)}  Unknown: {len(results)-len(truly_different)-len(truly_same)}")
     print(f"Kill rate: {kill_rate:.1f}% (target: ≥95%)")
     print(f"False proofs: {len(false_proofs)} (target: 0)")
     if false_proofs:
         for fp in false_proofs[:5]: print(f"  FALSE PROOF: {fp.task_id} op={fp.operator}")
-    by_status = Counter(r.counterexample_replay for r in ce_results)
     print(f"CE replay: {by_status['replayed']}/{len(ce_results)} replayed "
           f"({by_status['not_reproduced']} not_reproduced = possible checker bugs, "
           f"{by_status['driver_error']} driver_error = replay tooling problems)")
     print(f"Time: {elapsed:.1f}s")
+
+    if json_out:
+        import json as _json
+        summary = {
+            "tasks": len(tasks),
+            "loops_only": loops_only,
+            "mutants": len(results),
+            "truly_different": len(truly_different),
+            "truly_same": len(truly_same),
+            "unknown": len(results) - len(truly_different) - len(truly_same),
+            "kill_rate_pct": round(kill_rate, 2),
+            "false_proofs": len(false_proofs),
+            "ce_total": len(ce_results),
+            "ce_replayed": by_status["replayed"],
+            "ce_not_reproduced": by_status["not_reproduced"],
+            "ce_driver_error": by_status["driver_error"],
+            "elapsed_s": round(elapsed, 2),
+        }
+        with open(json_out, "w") as out:
+            _json.dump(summary, out, indent=2)
     return results
 
 
@@ -205,5 +271,12 @@ if __name__ == "__main__":
     p.add_argument("--n-workers", type=int, default=1)
     p.add_argument("--data-dir", type=str, default=None)
     p.add_argument("--tasks-jsonl", type=str, default=None)
+    p.add_argument("--loops-only", action="store_true", help="Filter to tasks with n_loops > 0")
+    p.add_argument("--seed", type=int, default=None, help="Random seed for reproducible mutant sampling")
+    p.add_argument("--json-out", type=str, default=None, help="Write summary JSON to path")
     args = p.parse_args()
-    run_mutation_study(args.n_tasks, args.mutants_per_task, args.n_workers, args.data_dir, args.tasks_jsonl)
+    run_mutation_study(
+        args.n_tasks, args.mutants_per_task, args.n_workers,
+        args.data_dir, args.tasks_jsonl,
+        loops_only=args.loops_only, seed=args.seed, json_out=args.json_out,
+    )
