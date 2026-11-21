@@ -14,12 +14,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install CBMC
+      - name: Install CBMC and Valgrind
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq valgrind
           curl -L -o /tmp/cbmc.deb \
             "https://github.com/diffblue/cbmc/releases/download/cbmc-6.11.0/ubuntu-24.04-cbmc-6.11.0-Linux.deb"
           sudo dpkg -i /tmp/cbmc.deb
           cbmc --version
+          valgrind --version
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,12 +37,17 @@ jobs:
           cbmc --arch x86_64 --function harness tests/golden/000_smoke/test_equiv.c
           cbmc --arch x86_64 --function harness tests/golden/000_smoke/test_neq.c || true
 
-      - name: Run golden suite (parametric)
-        run: python -m pytest tests/test_golden.py -v --timeout=60
+      - name: Run full pytest suite
+        run: python -m pytest tests/ -v --timeout=60
         env:
           PYTHONPATH: .
 
       - name: Run self-equivalence on 200-task fixture
         run: python ci/check_self_equiv.py
+        env:
+          PYTHONPATH: .
+
+      - name: Validate speed proxy (callgrind vs inproc_time on x86-64)
+        run: python scripts/validate_speed_proxy.py
         env:
           PYTHONPATH: .
