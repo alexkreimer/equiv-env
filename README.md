@@ -31,7 +31,7 @@ cbmc --function harness --trace tests/golden/000_smoke/test_neq.c
 
 ```
 equiv/
-  extract.py     — parse C functions, check eligibility via clang AST
+  extract.py     — parse C functions, check eligibility (regex for now; see TODO)
   harness.py     — generate CBMC equivalence harness
   verify.py      — run CBMC, parse results
   testgen.py     — cheap random/IO test pre-filter
@@ -50,3 +50,7 @@ scripts/
 ## Key decisions
 
 See [DECISIONS.md](DECISIONS.md) for all deviations from the execution spec.
+
+## TODO
+
+- [ ] **Replace regex C parsing with Clang AST (`equiv/extract.py`, `equiv/harness.py`):** Hand off signature parsing, canonical `typedef` resolution (`u32`, `uint`, `byte`, etc.), callee/global detection, loop counting, and function-name offset extraction to `clang -Xclang -ast-dump=json -Xclang -ast-dump-filter=<fname> -fsyntax-only` behind a lightweight Python pre-filter (zero new dependencies).
