@@ -11,14 +11,18 @@ Usage:
 from __future__ import annotations
 
 import hashlib
+import os
+import re
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Literal
 
 from .cache import EvalCache
 from .config import config_hash as compute_config_hash, get_config, load_config
-from .extract import Task
-from .verify import verify, VerifyResult, self_verify
+from .extract import Task, _strip_comments
+from .verify import verify, VerifyResult, self_verify, _run_cbmc_raw, _has_safety_failures
 
 
 EvalStatus = Literal[
@@ -63,6 +67,142 @@ def init(config: dict | None = None, cache_path: str | None = None):
     _config_hash = compute_config_hash(cfg)
 
 
+_C_KEYWORDS = {
+    "auto", "break", "case", "char", "const", "continue", "default", "do",
+    "double", "else", "enum", "extern", "float", "for", "goto", "if",
+    "inline", "int", "long", "register", "restrict", "return", "short",
+    "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
+    "unsigned", "void", "volatile", "while", "_Bool", "bool", "size_t",
+    "ssize_t", "ptrdiff_t", "int8_t", "uint8_t", "int16_t", "uint16_t",
+    "int32_t", "uint32_t", "int64_t", "uint64_t", "NULL", "true", "false",
+}
+_IDENT_RE = re.compile(r'\b[A-Za-z_]\w*\b')
+_LOCAL_LABEL_RE = re.compile(r'\b(?:LBB\d+_\d+|\.L\w+|Ltmp\d+)\b')
+
+
+def _canonicalize_source(src: str) -> str:
+    """Strip comments, collapse whitespace, and alpha-rename non-keyword identifiers."""
+    cleaned = _strip_comments(src)
+    mapping: dict[str, str] = {}
+
+    def _repl(m: re.Match) -> str:
+        tok = m.group(0)
+        if tok in _C_KEYWORDS:
+            return tok
+        if tok not in mapping:
+            mapping[tok] = f"v{len(mapping)}"
+        return mapping[tok]
+
+    canon = _IDENT_RE.sub(_repl, cleaned)
+    return re.sub(r'\s+', ' ', canon).strip()
+
+
+def _normalized_o3_asm(task: Task, func_src: str) -> str | None:
+    """Compile a single function at -O3 and return normalized assembly instructions."""
+    from .harness import _extract_function_name, _filter_deps, _header_for_task
+    from .speed import _external_function_src, default_arch
+
+    fname = _extract_function_name(func_src) or task.func_name
+    body = _external_function_src(task, func_src, fname, "fut__cmp")
+    if body is None:
+        return None
+
+    deps = _filter_deps(task.deps_src) if task.deps_src else ""
+    tu = "\n".join([_header_for_task(task), deps, body, ""])
+    arch = default_arch()
+    flags = ["-O3", "-fsigned-char", "-fno-builtin", "-w"] + ([f"-march={arch}"] if arch else [])
+
+    with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+        f.write(tu)
+        src_path = f.name
+    try:
+        r = subprocess.run(
+            ["gcc", *flags, "-S", "-o", "-", src_path],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            return None
+        insns: list[str] = []
+        for line in r.stdout.splitlines():
+            # Strip trailing inline comments
+            line = re.sub(r'(?://|;|#).*$', '', line).strip()
+            if not line or line.startswith(".") or line.endswith(":"):
+                continue
+            line = _LOCAL_LABEL_RE.sub("LBL", line)
+            line = re.sub(r'\s+', ' ', line)
+            insns.append(line)
+        return "\n".join(insns) if insns else None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    finally:
+        try:
+            os.unlink(src_path)
+        except OSError:
+            pass
+
+
+def check_near_identical(task: Task, candidate_src: str) -> bool:
+    """Return True if candidate is a copy or cosmetic rewrite of the original.
+
+    R1 spec Step 8:
+      1. Canonicalized source (comments/whitespace stripped, identifiers renamed) matches, OR
+      2. Both compile at -O3 to identical normalized assembly instructions.
+    """
+    if _canonicalize_source(task.func_src) == _canonicalize_source(candidate_src):
+        return True
+    orig_asm = _normalized_o3_asm(task, task.func_src)
+    cand_asm = _normalized_o3_asm(task, candidate_src)
+    if orig_asm is not None and cand_asm is not None and orig_asm == cand_asm:
+        return True
+    return False
+
+
+def _run_overlap_check(
+    task: Task,
+    candidate_src: str,
+    *,
+    maxn: int,
+    unwind: int,
+    timeout_s: float,
+    extra_cbmc_flags: list[str] | None,
+) -> str:
+    """Run the overlapping-buffer CBMC check (R1 spec Step 3 item 5).
+
+    Returns: "not_applicable" | "skipped_original_ub" | "passed" | "failed"
+    """
+    from .harness import generate_overlap_harness
+
+    cand_harness = generate_overlap_harness(task, candidate_src, maxn=maxn, unwind=unwind)
+    if cand_harness is None:
+        return "not_applicable"
+
+    def _run_src(src: str, flags: list[str] | None) -> subprocess.CompletedProcess | None:
+        with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+            f.write(src)
+            path = f.name
+        try:
+            return _run_cbmc_raw(path, unwind, timeout_s, extra_flags=flags)
+        except subprocess.TimeoutExpired:
+            return None
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    # Check whether the original itself has UB under overlap
+    orig_harness = generate_overlap_harness(task, task.func_src, maxn=maxn, unwind=unwind)
+    if orig_harness is not None:
+        orig_res = _run_src(orig_harness.harness_src, None)
+        if orig_res is not None and _has_safety_failures(orig_res.stdout):
+            return "skipped_original_ub"
+
+    cand_res = _run_src(cand_harness.harness_src, extra_cbmc_flags)
+    if cand_res is not None and "VERIFICATION SUCCESSFUL" in cand_res.stdout:
+        return "passed"
+    return "failed"
+
+
 def evaluate(
     task: Task,
     candidate_src: str,
@@ -70,23 +210,14 @@ def evaluate(
     timeout_s: float = 60,
     maxn: int = 8,
     skip_tests: bool = False,
+    skip_speed: bool = False,
     extra_cbmc_flags: list[str] | None = None,
     _allow_overflow_off: bool = False,  # internal: only for self-equiv
 ) -> EvalResult:
     """Evaluate a candidate against the original function.
 
-    Pipeline: compile → cheap tests → CBMC verify → speed proxy.
-
-    Args:
-        task: The eligible Task.
-        candidate_src: The candidate function source code.
-        timeout_s: Timeout per CBMC check.
-        maxn: Maximum buffer size.
-        skip_tests: Skip the cheap test pre-filter (for debugging).
-        extra_cbmc_flags: Additional CBMC flags.
-
-    Returns:
-        EvalResult with status and timing information.
+    Pipeline: cache → cheap tests → CBMC verify → overlap check →
+              near_identical check → speed proxy (+ large-input checksum).
     """
     # Enforce: candidate checks MUST run with signed-overflow-check ON.
     # --no-signed-overflow-check is only allowed for self-equivalence.
@@ -107,6 +238,7 @@ def evaluate(
 
     # 1. Normalize candidate
     candidate_src = candidate_src.strip()
+    eff_unwind = task.unwind or (maxn + 2)
 
     # 2. Cheap test pre-filter
     if not skip_tests:
@@ -126,13 +258,12 @@ def evaluate(
     else:
         test_result = None
 
-    # 3. CBMC verify
+    # 3. CBMC main verify (using task.unwind)
     verify_result = verify(
         task, candidate_src, timeout_s=timeout_s, maxn=maxn,
-        extra_cbmc_flags=extra_cbmc_flags,
+        unwind=eff_unwind, extra_cbmc_flags=extra_cbmc_flags,
     )
 
-    # Map VerifyResult status to EvalResult
     status_map = {
         "proven": "proven",
         "not_equivalent": "not_equivalent",
@@ -144,12 +275,37 @@ def evaluate(
     }
 
     status = status_map.get(verify_result.status, "checker_error")
+    details = verify_result.details
+    overlap_check = "not_applicable"
+    near_identical = False
     speedup = 1.0
 
-    # 4. Speed proxy (only if proven)
+    # 4. Overlapping-buffer check (R1 spec Step 3 item 5)
     if status == "proven":
-        # Placeholder — speed.py will fill this in
-        speedup = 1.0
+        overlap_check = _run_overlap_check(
+            task, candidate_src, maxn=maxn, unwind=eff_unwind,
+            timeout_s=timeout_s, extra_cbmc_flags=extra_cbmc_flags,
+        )
+        if overlap_check == "failed":
+            status = "not_equivalent"
+            details = "Failed overlapping-buffer equivalence check"
+
+    # 5. Near-identical check + speed proxy (+ large-input differential checksum)
+    if status == "proven":
+        near_identical = check_near_identical(task, candidate_src)
+        if not near_identical and not skip_speed:
+            from .speed import have_valgrind, measure_speedup
+
+            cfg_proxy = (_active_config or get_config()).get("speed", {}).get("proxy", "inproc_time")
+            proxy = "callgrind" if (cfg_proxy == "callgrind" and have_valgrind()) else "inproc_time"
+            sr = measure_speedup(task, candidate_src, proxy=proxy)
+            if sr.error is None:
+                if not sr.outputs_match:
+                    status = "not_equivalent"
+                    details = "Large-input checksum mismatch (possible bound-overfitting for n > MAXN)"
+                    speedup = 1.0
+                else:
+                    speedup = sr.speedup
 
     check_time = time.monotonic() - start_time
 
@@ -166,7 +322,9 @@ def evaluate(
             "check_time_s": verify_result.check_time_s,
             "details": verify_result.details,
         },
-        details=verify_result.details,
+        overlap_check=overlap_check,
+        near_identical=near_identical,
+        details=details,
     )
 
     _cache_put(task.task_id, candidate_src, result)
