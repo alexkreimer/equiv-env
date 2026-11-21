@@ -69,8 +69,8 @@ def test_evaluate_detects_near_identical_rename_and_cosmetic_rewrite():
     assert reward(res, base=0.1) == 0.0
 
 
-def test_evaluate_rejects_bound_overfitting_exploit_via_large_input_checksum():
-    """Candidate `if (n > 8) return 0;` passes CBMC (MAXN=8) but fails BENCH_N=512 checksum."""
+def test_evaluate_rejects_bound_overfitting_exploit_via_large_input_checks():
+    """Candidate `if (n > 8) return 0;` passes CBMC (MAXN=8) but fails the n > MAXN checks."""
     orig = "int sum_arr(int *a, int n) { int s = 0; for (int i = 0; i < n; i++) s += a[i]; return s; }"
     exploit = (
         "int sum_arr(int *a, int n) {\n"
@@ -84,8 +84,8 @@ def test_evaluate_rejects_bound_overfitting_exploit_via_large_input_checksum():
     )
 
     res = evaluate(task, exploit, skip_tests=True)
-    assert res.status == "not_equivalent", f"Bound-overfitting exploit must be rejected, got {res}"
-    assert "checksum" in res.details.lower()
+    assert res.status == "bound_overfit", f"Bound-overfitting exploit must be rejected, got {res}"
+    assert res.large_input_check == "failed"
     assert reward(res) == 0.0
 
 
